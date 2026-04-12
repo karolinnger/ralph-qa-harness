@@ -1,0 +1,9 @@
+node_modules/
+.qa-harness/
+.features-gen/
+playwright-report/
+test-results/
+coverage/
+*.log
+*.tgz
+
