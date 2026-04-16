@@ -57,6 +57,7 @@ Public Sub BuildAgenticHarnessDeck()
         )
 
     AddFlowSlide pres
+    AddExternalHarnessSlide pres
 
     AddBulletSlide pres, _
         "Broader Relevance", _
@@ -191,6 +192,73 @@ Private Sub AddFlowSlide(ByVal pres As Presentation)
     DrawMessageArrow sld, orchCenter, userCenter, 462, "Completion summary", True
 End Sub
 
+Private Sub AddExternalHarnessSlide(ByVal pres As Presentation)
+    Dim sld As Slide
+    Dim titleBox As Shape
+    Dim subtitleBox As Shape
+    Dim orchBox As Shape
+    Dim plannerBox As Shape
+    Dim builderBox As Shape
+    Dim qaBox As Shape
+    Dim handoffBand As Shape
+
+    Set sld = pres.Slides.Add(pres.Slides.Count + 1, ppLayoutBlank)
+    ApplySlideBackground sld
+
+    Set titleBox = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, TITLE_LEFT, TITLE_TOP, TITLE_W, TITLE_H)
+    With titleBox.TextFrame.TextRange
+        .Text = UCase$("External Harness View")
+        .Font.Name = "Aptos Display"
+        .Font.Size = 26
+        .Font.Bold = msoTrue
+        .Font.Color.RGB = RGB(20, 27, 52)
+    End With
+
+    Set subtitleBox = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, SUBTITLE_LEFT, SUBTITLE_TOP, SUBTITLE_W, SUBTITLE_H)
+    With subtitleBox.TextFrame.TextRange
+        .Text = "Zoomed-Out Operating Model"
+        .Font.Name = "Aptos"
+        .Font.Size = 14
+        .Font.Color.RGB = RGB(177, 34, 45)
+    End With
+
+    Set orchBox = AddDiagramBox(sld, 336, 108, 290, 54, "Top-Level Orchestrator")
+    Set plannerBox = AddDiagramBox(sld, 70, 226, 190, 56, "Architect / Planner Harness")
+    Set builderBox = AddDiagramBox(sld, 388, 226, 196, 56, "Builder / Developer Harness")
+    Set qaBox = AddDiagramBox(sld, 714, 226, 146, 56, "QA Harness")
+
+    Set handoffBand = sld.Shapes.AddShape(msoShapeRoundedRectangle, 128, 374, 698, 58)
+    With handoffBand
+        .Fill.ForeColor.RGB = RGB(245, 245, 245)
+        .Line.ForeColor.RGB = RGB(191, 193, 202)
+        .Line.Weight = 1.25
+        With .TextFrame.TextRange
+            .Text = "Shared Artifacts / Handoffs"
+            .Font.Name = "Aptos"
+            .Font.Size = 18
+            .Font.Bold = msoTrue
+            .Font.Color.RGB = RGB(52, 58, 74)
+            .ParagraphFormat.Alignment = ppAlignCenter
+        End With
+        .TextFrame.VerticalAnchor = msoAnchorMiddle
+    End With
+
+    DrawBoxConnector sld, orchBox, plannerBox, False
+    DrawBoxConnector sld, orchBox, builderBox, False
+    DrawBoxConnector sld, orchBox, qaBox, False
+
+    DrawMessageArrow sld, CenterX(plannerBox), CenterX(builderBox), 206, "scope, plan, acceptance criteria"
+    DrawMessageArrow sld, CenterX(builderBox), CenterX(qaBox), 206, "implementation, release candidate"
+    DrawMessageArrow sld, CenterX(qaBox), CenterX(orchBox), 180, "quality verdict, evidence, issues", True
+
+    DrawMessageArrow sld, CenterX(qaBox), CenterX(builderBox), 312, "defects / fixes", True
+    DrawMessageArrow sld, CenterX(builderBox), CenterX(plannerBox), 336, "clarifications / change requests", True
+
+    DrawVerticalArrow sld, CenterX(plannerBox), plannerBox.Top + plannerBox.Height, handoffBand.Top, False
+    DrawVerticalArrow sld, CenterX(builderBox), builderBox.Top + builderBox.Height, handoffBand.Top, False
+    DrawVerticalArrow sld, CenterX(qaBox), qaBox.Top + qaBox.Height, handoffBand.Top, False
+End Sub
+
 Private Function AddLaneHeader(ByVal sld As Slide, ByVal leftPos As Single, ByVal topPos As Single, ByVal boxW As Single, ByVal boxH As Single, ByVal textValue As String) As Single
     Dim shp As Shape
 
@@ -289,6 +357,61 @@ Private Sub DrawLoopFrame(ByVal sld As Slide, ByVal leftPos As Single, ByVal top
         .Font.Size = 10
         .Font.Bold = msoTrue
         .Font.Color.RGB = RGB(95, 100, 116)
+    End With
+End Sub
+
+Private Function AddDiagramBox(ByVal sld As Slide, ByVal leftPos As Single, ByVal topPos As Single, ByVal boxW As Single, ByVal boxH As Single, ByVal textValue As String) As Shape
+    Dim shp As Shape
+
+    Set shp = sld.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, topPos, boxW, boxH)
+    With shp
+        .Fill.ForeColor.RGB = RGB(20, 27, 52)
+        .Line.ForeColor.RGB = RGB(120, 125, 140)
+        .Line.Weight = 1.25
+        With .TextFrame.TextRange
+            .Text = textValue
+            .Font.Name = "Aptos"
+            .Font.Size = 14
+            .Font.Bold = msoTrue
+            .Font.Color.RGB = RGB(255, 255, 255)
+            .ParagraphFormat.Alignment = ppAlignCenter
+        End With
+        .TextFrame.WordWrap = msoTrue
+        .TextFrame.VerticalAnchor = msoAnchorMiddle
+    End With
+
+    Set AddDiagramBox = shp
+End Function
+
+Private Function CenterX(ByVal shp As Shape) As Single
+    CenterX = shp.Left + (shp.Width / 2)
+End Function
+
+Private Sub DrawVerticalArrow(ByVal sld As Slide, ByVal xPos As Single, ByVal fromY As Single, ByVal toY As Single, Optional ByVal dashed As Boolean = False)
+    Dim ln As Shape
+
+    Set ln = sld.Shapes.AddLine(xPos, fromY, xPos, toY)
+    With ln.Line
+        .ForeColor.RGB = RGB(110, 114, 126)
+        .Weight = 1.4
+        If dashed Then
+            .DashStyle = msoLineDash
+        End If
+        .EndArrowheadStyle = msoArrowheadTriangle
+    End With
+End Sub
+
+Private Sub DrawBoxConnector(ByVal sld As Slide, ByVal fromShape As Shape, ByVal toShape As Shape, Optional ByVal dashed As Boolean = False)
+    Dim ln As Shape
+
+    Set ln = sld.Shapes.AddLine(CenterX(fromShape), fromShape.Top + fromShape.Height, CenterX(toShape), toShape.Top)
+    With ln.Line
+        .ForeColor.RGB = RGB(110, 114, 126)
+        .Weight = 1.4
+        If dashed Then
+            .DashStyle = msoLineDash
+        End If
+        .EndArrowheadStyle = msoArrowheadTriangle
     End With
 End Sub
 
