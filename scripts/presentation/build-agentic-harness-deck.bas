@@ -1,4 +1,3 @@
-Attribute VB_Name = "AgenticHarnessDeck"
 Option Explicit
 
 Private Const SLIDE_W As Single = 960
@@ -128,8 +127,6 @@ Private Sub AddBulletSlide(ByVal pres As Presentation, ByVal titleText As String
             .Bullet.Visible = msoTrue
             .Bullet.Character = 8226
             .Bullet.Font.Color.RGB = RGB(177, 34, 45)
-            .LeftMargin = 18
-            .FirstLineIndent = -12
         End With
     Next i
 End Sub
@@ -138,17 +135,12 @@ Private Sub AddFlowSlide(ByVal pres As Presentation)
     Dim sld As Slide
     Dim titleBox As Shape
     Dim subtitleBox As Shape
-    Dim artifactBand As Shape
-    Dim loopLabel As Shape
-    Dim stopNote As Shape
-
-    Dim userBox As Shape
-    Dim orchBox As Shape
-    Dim itemBox As Shape
-    Dim roleBox As Shape
-    Dim proofBox As Shape
-    Dim verifyBox As Shape
-    Dim statusBox As Shape
+    Dim userCenter As Single
+    Dim plannerCenter As Single
+    Dim orchCenter As Single
+    Dim builderCenter As Single
+    Dim reviewerCenter As Single
+    Dim fsCenter As Single
 
     Set sld = pres.Slides.Add(pres.Slides.Count + 1, ppLayoutBlank)
     ApplySlideBackground sld
@@ -170,151 +162,133 @@ Private Sub AddFlowSlide(ByVal pres As Presentation)
         .Font.Color.RGB = RGB(177, 34, 45)
     End With
 
-    Set userBox = AddFlowBox(sld, 28, 138, 104, 42, "User" & vbCrLf & "Request", RGB(246, 247, 250), RGB(20, 27, 52))
-    Set orchBox = AddFlowBox(sld, 148, 138, 110, 42, "Orchestrator", RGB(20, 27, 52), RGB(255, 255, 255))
-    Set itemBox = AddFlowBox(sld, 276, 138, 108, 42, "Select Item", RGB(233, 238, 246), RGB(20, 27, 52))
-    Set roleBox = AddFlowBox(sld, 402, 126, 126, 66, "Fresh-Session Role" & vbCrLf & "Clarify | Plan" & vbCrLf & "Explore | Execute | Heal", RGB(246, 247, 250), RGB(20, 27, 52))
-    Set proofBox = AddFlowBox(sld, 546, 138, 100, 42, "Proof", RGB(233, 238, 246), RGB(20, 27, 52))
-    Set verifyBox = AddFlowBox(sld, 664, 138, 96, 42, "Verifier", RGB(20, 27, 52), RGB(255, 255, 255))
-    Set statusBox = AddFlowBox(sld, 778, 138, 118, 42, "Update Status", RGB(246, 247, 250), RGB(20, 27, 52))
+    userCenter = AddLaneHeader(sld, 24, 112, 92, 40, "User")
+    plannerCenter = AddLaneHeader(sld, 142, 112, 110, 46, "Planner" & vbCrLf & "[qa-planner]")
+    orchCenter = AddLaneHeader(sld, 282, 112, 132, 46, "Orchestrator" & vbCrLf & "[qa-orchestrator]")
+    builderCenter = AddLaneHeader(sld, 448, 104, 154, 62, "Builder" & vbCrLf & "[qa-explorer /" & vbCrLf & "qa-executor /" & vbCrLf & "qa-healer]")
+    reviewerCenter = AddLaneHeader(sld, 638, 112, 112, 46, "Reviewer" & vbCrLf & "[qa-verifier]")
+    fsCenter = AddLaneHeader(sld, 790, 112, 126, 46, "Filesystem" & vbCrLf & "[run artifacts]")
 
-    ConnectShapes sld, userBox, orchBox
-    ConnectShapes sld, orchBox, itemBox
-    ConnectShapes sld, itemBox, roleBox
-    ConnectShapes sld, roleBox, proofBox
-    ConnectShapes sld, proofBox, verifyBox
-    ConnectShapes sld, verifyBox, statusBox
+    DrawLane sld, userCenter, 154, 474
+    DrawLane sld, plannerCenter, 160, 474
+    DrawLane sld, orchCenter, 160, 474
+    DrawLane sld, builderCenter, 166, 474
+    DrawLane sld, reviewerCenter, 160, 474
+    DrawLane sld, fsCenter, 160, 474
 
-    Set artifactBand = sld.Shapes.AddShape(msoShapeRoundedRectangle, 146, 276, 632, 72)
-    With artifactBand
-        .Fill.ForeColor.RGB = RGB(245, 245, 245)
-        .Line.ForeColor.RGB = RGB(191, 193, 202)
-        .Line.Weight = 1.5
-        .TextFrame.TextRange.Text = "Durable Run Artifacts" & vbCrLf & "PRD  |  Progress  |  Prompt  |  Execution Truth"
-        With .TextFrame.TextRange
-            .Font.Name = "Aptos"
-            .Font.Size = 18
-            .Font.Bold = msoTrue
-            .Font.Color.RGB = RGB(52, 58, 74)
-            .ParagraphFormat.Alignment = ppAlignCenter
-        End With
-        .TextFrame.TextRange.Paragraphs(2).Font.Size = 15
-        .TextFrame.TextRange.Paragraphs(2).Font.Bold = msoFalse
-    End With
+    DrawMessageArrow sld, userCenter, plannerCenter, 178, "Requirements / scope"
+    DrawMessageArrow sld, plannerCenter, fsCenter, 206, "Write PRD.md + progress.md + PROMPT.md"
+    DrawMessageArrow sld, userCenter, orchCenter, 234, "Start loop"
 
-    ConnectToArtifactBand sld, orchBox, artifactBand
-    ConnectToArtifactBand sld, roleBox, artifactBand
-    ConnectToArtifactBand sld, verifyBox, artifactBand
+    DrawLoopFrame sld, 266, 252, 634, 188, "Loop until tasks complete"
 
-    AddLoopArrow sld, statusBox, orchBox
-
-    Set loopLabel = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, 650, 86, 180, 18)
-    With loopLabel.TextFrame.TextRange
-        .Text = "Next bounded iteration"
-        .Font.Name = "Aptos"
-        .Font.Size = 12
-        .Font.Color.RGB = RGB(177, 34, 45)
-        .Font.Bold = msoTrue
-    End With
-
-    Set stopNote = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, 186, 368, 560, 34)
-    With stopNote.TextFrame.TextRange
-        .Text = "Stops on no actionable items, verifier fail or blocked, or budget exhausted."
-        .Font.Name = "Aptos"
-        .Font.Size = 13
-        .Font.Color.RGB = RGB(95, 100, 116)
-        .ParagraphFormat.Alignment = ppAlignCenter
-    End With
+    DrawMessageArrow sld, orchCenter, fsCenter, 284, "Read current PRD.md + progress.md"
+    DrawMessageArrow sld, orchCenter, builderCenter, 314, "Assign one bounded task"
+    DrawMessageArrow sld, builderCenter, fsCenter, 344, "Read / update artifacts + evidence"
+    DrawMessageArrow sld, builderCenter, reviewerCenter, 374, "Submit result + evidence"
+    DrawMessageArrow sld, reviewerCenter, fsCenter, 404, "Check proof + update progress.md"
+    DrawMessageArrow sld, reviewerCenter, orchCenter, 434, "Verdict (pass / fail / blocked)", True
+    DrawMessageArrow sld, orchCenter, userCenter, 462, "Completion summary", True
 End Sub
 
-Private Function AddFlowBox(ByVal sld As Slide, ByVal leftPos As Single, ByVal topPos As Single, ByVal boxW As Single, ByVal boxH As Single, ByVal textValue As String, ByVal fillColor As Long, ByVal textColor As Long) As Shape
+Private Function AddLaneHeader(ByVal sld As Slide, ByVal leftPos As Single, ByVal topPos As Single, ByVal boxW As Single, ByVal boxH As Single, ByVal textValue As String) As Single
     Dim shp As Shape
 
     Set shp = sld.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, topPos, boxW, boxH)
     With shp
-        .Fill.ForeColor.RGB = fillColor
-        .Line.ForeColor.RGB = RGB(20, 27, 52)
-        .Line.Weight = 1.5
+        .Fill.ForeColor.RGB = RGB(20, 27, 52)
+        .Line.ForeColor.RGB = RGB(120, 125, 140)
+        .Line.Weight = 1
         With .TextFrame.TextRange
             .Text = textValue
             .Font.Name = "Aptos"
-            .Font.Size = 14
+            .Font.Size = 11
             .Font.Bold = msoTrue
-            .Font.Color.RGB = textColor
+            .Font.Color.RGB = RGB(255, 255, 255)
             .ParagraphFormat.Alignment = ppAlignCenter
         End With
+        .TextFrame.WordWrap = msoTrue
         .TextFrame.VerticalAnchor = msoAnchorMiddle
     End With
 
-    Set AddFlowBox = shp
+    AddLaneHeader = leftPos + (boxW / 2)
 End Function
 
-Private Sub ConnectShapes(ByVal sld As Slide, ByVal fromShape As Shape, ByVal toShape As Shape)
-    Dim conn As Shape
-    Dim startX As Single
-    Dim startY As Single
-    Dim endX As Single
-    Dim endY As Single
+Private Sub DrawLane(ByVal sld As Slide, ByVal xPos As Single, ByVal topPos As Single, ByVal bottomPos As Single)
+    Dim ln As Shape
 
-    startX = fromShape.Left + fromShape.Width
-    startY = fromShape.Top + (fromShape.Height / 2)
-    endX = toShape.Left
-    endY = toShape.Top + (toShape.Height / 2)
-
-    Set conn = sld.Shapes.AddLine(startX, startY, endX, endY)
-    With conn.Line
-        .ForeColor.RGB = RGB(120, 125, 140)
-        .Weight = 1.75
-        .EndArrowheadStyle = msoArrowheadTriangle
+    Set ln = sld.Shapes.AddLine(xPos, topPos, xPos, bottomPos)
+    With ln.Line
+        .ForeColor.RGB = RGB(170, 174, 184)
+        .Weight = 1
     End With
 End Sub
 
-Private Sub ConnectToArtifactBand(ByVal sld As Slide, ByVal fromShape As Shape, ByVal artifactBand As Shape)
-    Dim conn As Shape
-    Dim xPos As Single
-    Dim startY As Single
-    Dim endY As Single
+Private Sub DrawMessageArrow(ByVal sld As Slide, ByVal fromX As Single, ByVal toX As Single, ByVal yPos As Single, ByVal labelText As String, Optional ByVal dashed As Boolean = False)
+    Dim ln As Shape
+    Dim labelBox As Shape
+    Dim leftPos As Single
+    Dim boxW As Single
+    Dim minX As Single
+    Dim maxX As Single
 
-    xPos = fromShape.Left + (fromShape.Width / 2)
-    startY = fromShape.Top + fromShape.Height
-    endY = artifactBand.Top
+    Set ln = sld.Shapes.AddLine(fromX, yPos, toX, yPos)
+    With ln.Line
+        .ForeColor.RGB = RGB(110, 114, 126)
+        .Weight = 1.5
+        If dashed Then
+            .DashStyle = msoLineDash
+        End If
+        If toX >= fromX Then
+            .EndArrowheadStyle = msoArrowheadTriangle
+        Else
+            .BeginArrowheadStyle = msoArrowheadTriangle
+        End If
+    End With
 
-    Set conn = sld.Shapes.AddLine(xPos, startY, xPos, endY)
-    With conn.Line
-        .ForeColor.RGB = RGB(191, 193, 202)
-        .Weight = 1.25
+    If fromX < toX Then
+        minX = fromX
+        maxX = toX
+    Else
+        minX = toX
+        maxX = fromX
+    End If
+
+    boxW = maxX - minX - 12
+    If boxW < 120 Then
+        boxW = 120
+    End If
+    leftPos = ((fromX + toX) / 2) - (boxW / 2)
+
+    Set labelBox = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, leftPos, yPos - 16, boxW, 14)
+    With labelBox.TextFrame.TextRange
+        .Text = labelText
+        .Font.Name = "Aptos"
+        .Font.Size = 10
+        .Font.Color.RGB = RGB(52, 58, 74)
+        .ParagraphFormat.Alignment = ppAlignCenter
     End With
 End Sub
 
-Private Sub AddLoopArrow(ByVal sld As Slide, ByVal fromShape As Shape, ByVal toShape As Shape)
-    Dim xRight As Single
-    Dim xLeft As Single
-    Dim yTop As Single
-    Dim yTarget As Single
-    Dim seg As Shape
+Private Sub DrawLoopFrame(ByVal sld As Slide, ByVal leftPos As Single, ByVal topPos As Single, ByVal boxW As Single, ByVal boxH As Single, ByVal labelText As String)
+    Dim frame As Shape
+    Dim labelBox As Shape
 
-    xRight = fromShape.Left + (fromShape.Width / 2)
-    xLeft = toShape.Left + (toShape.Width / 2)
-    yTop = 98
-    yTarget = toShape.Top
-
-    Set seg = sld.Shapes.AddLine(xRight, fromShape.Top, xRight, yTop)
-    With seg.Line
-        .ForeColor.RGB = RGB(177, 34, 45)
-        .Weight = 2
+    Set frame = sld.Shapes.AddShape(msoShapeRectangle, leftPos, topPos, boxW, boxH)
+    With frame
+        .Fill.Visible = msoFalse
+        .Line.ForeColor.RGB = RGB(150, 154, 166)
+        .Line.Weight = 1
+        .Line.DashStyle = msoLineDash
     End With
 
-    Set seg = sld.Shapes.AddLine(xRight, yTop, xLeft, yTop)
-    With seg.Line
-        .ForeColor.RGB = RGB(177, 34, 45)
-        .Weight = 2
-    End With
-
-    Set seg = sld.Shapes.AddLine(xLeft, yTop, xLeft, yTarget)
-    With seg.Line
-        .ForeColor.RGB = RGB(177, 34, 45)
-        .Weight = 2
-        .EndArrowheadStyle = msoArrowheadTriangle
+    Set labelBox = sld.Shapes.AddTextbox(msoTextOrientationHorizontal, leftPos + 6, topPos - 12, 160, 14)
+    With labelBox.TextFrame.TextRange
+        .Text = labelText
+        .Font.Name = "Aptos"
+        .Font.Size = 10
+        .Font.Bold = msoTrue
+        .Font.Color.RGB = RGB(95, 100, 116)
     End With
 End Sub
 
