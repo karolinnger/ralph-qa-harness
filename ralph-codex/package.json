@@ -1,0 +1,31 @@
+{
+  "name": "ralph-codex",
+  "version": "0.1.0",
+  "description": "Standalone Ralph loop supervisor for OpenAI Codex.",
+  "main": "./src/cli.js",
+  "bin": {
+    "ralph-codex": "./bin/ralph-codex.js"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/unit/*.test.js tests/integration/*.test.js",
+    "cli": "node ./bin/ralph-codex.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "codex",
+    "ralph",
+    "cli",
+    "agent-loop"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  }
+}
