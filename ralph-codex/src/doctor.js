@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { readConfig, validateConfig } = require('./config');
+const { readConfig } = require('./config');
 const { requireGitRepo } = require('./git');
 const { runProcess } = require('./process');
 const { resolveRalphPaths } = require('./state');
@@ -39,14 +39,8 @@ function doctor(options = {}) {
 
   if (fs.existsSync(paths.configPath)) {
     try {
-      const raw = JSON.parse(fs.readFileSync(paths.configPath, 'utf8'));
-      const validation = validateConfig(raw);
-      if (validation.status === 'pass') {
-        config = validation.config;
-        checks.push(check('pass', 'config', 'config is valid'));
-      } else {
-        checks.push(check('fail', 'config', validation.errors.join('; ')));
-      }
+      config = readConfig(paths.configPath);
+      checks.push(check('pass', 'config', 'config is valid'));
     } catch (error) {
       checks.push(check('fail', 'config', error.message));
     }

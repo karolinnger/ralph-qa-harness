@@ -10,13 +10,13 @@ function buildCodexExecArgs({ config, repoRoot, overrides = {} }) {
   };
   return [
     ...(Array.isArray(codex.args) ? codex.args : []),
+    '--ask-for-approval',
+    codex.approvalPolicy,
     'exec',
     '--cd',
     repoRoot,
     '--sandbox',
     codex.sandbox,
-    '--ask-for-approval',
-    codex.approvalPolicy,
     '--color',
     'never',
     ...(codex.model ? ['--model', codex.model] : []),

@@ -74,6 +74,18 @@ test('doctor fails for non-repo invalid config missing Codex and blocked PowerSh
   assert.match(formatDoctorOutput(shimResult), /codex\.exe/);
 });
 
+test('doctor accepts BOM-prefixed config files written by Windows PowerShell', (t) => {
+  const repoRoot = initFakeRepo(t);
+  const configPath = path.join(repoRoot, '.ralph', 'config.json');
+  const config = readConfig(configPath);
+  fs.writeFileSync(configPath, `\uFEFF${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+  const result = doctor({ repoRoot, env: process.env });
+
+  assert.equal(result.status, 'pass');
+  assert.match(formatDoctorOutput(result), /PASS config/);
+});
+
 test('verify reruns deterministic validation and optional fresh Codex review', (t) => {
   const repoRoot = initFakeRepo(t);
   let stdout = '';

@@ -18,17 +18,22 @@ function requiresCmdShim(command, platform = process.platform) {
 }
 
 function quoteForCmd(value) {
-  return `"${String(value).replace(/"/gu, '\\"')}"`;
+  return `"${String(value).replace(/"/gu, '""')}"`;
+}
+
+function quoteCommandForCmd(command) {
+  return /[\\/:"]/u.test(command) || /\s/u.test(command) ? quoteForCmd(command) : command;
 }
 
 function buildSpawnCommand(command, args, platform) {
   if (!requiresCmdShim(command, platform)) {
     return { command, args };
   }
-  const line = [quoteForCmd(command), ...args.map(quoteForCmd)].join(' ');
+  const line = ['call', quoteCommandForCmd(command), ...args.map(quoteForCmd)].join(' ');
   return {
     command: 'cmd.exe',
     args: ['/d', '/s', '/c', line],
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -46,6 +51,7 @@ function runProcess(options) {
       encoding: 'utf8',
       shell: false,
       timeout: options.timeoutMs || 0,
+      windowsVerbatimArguments: Boolean(spawnCommand.windowsVerbatimArguments),
       windowsHide: true,
       maxBuffer: options.maxBuffer || 20 * 1024 * 1024,
     });
