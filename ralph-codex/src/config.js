@@ -109,7 +109,7 @@ function validateConfig(rawConfig) {
 }
 
 function readConfig(configPath) {
-  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/u, ''));
   const validation = validateConfig(parsed);
   if (validation.status === 'fail') {
     throw new Error(`Invalid config at ${configPath}: ${validation.errors.join('; ')}`);

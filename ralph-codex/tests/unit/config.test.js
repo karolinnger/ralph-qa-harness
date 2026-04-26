@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const {
@@ -57,4 +58,15 @@ test('writeDefaultConfig and readConfig round-trip config JSON', (t) => {
 
   assert.equal(fs.existsSync(configPath), true);
   assert.equal(config.codex.command, 'codex');
+});
+
+test('readConfig accepts UTF-8 BOM files written by Windows PowerShell', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-codex-config-'));
+  const configPath = path.join(tempDir, 'config.json');
+  fs.writeFileSync(configPath, `\uFEFF${JSON.stringify(createDefaultConfig(), null, 2)}\n`, 'utf8');
+
+  const config = readConfig(configPath);
+
+  assert.equal(config.codex.command, 'codex');
+  fs.rmSync(tempDir, { recursive: true, force: true });
 });
