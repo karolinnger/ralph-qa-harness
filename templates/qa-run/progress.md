@@ -1,11 +1,11 @@
-# QA Run Progress
+# QA Harness Progress
 
 ## Rules
 
-- Complete exactly one atomic item per iteration.
-- Do not mark an item `pass` until verification succeeds.
-- Record MCP fallback reasons in the selected item and `logs/fallback.log` when used.
-- Treat `PRD.md`, `progress.md`, `PROMPT.md`, and `normalized.feature` as the run artifact set.
+- Complete exactly one selected checkbox item per Copilot process.
+- Use `.qa-harness/PRD.md`, `.qa-harness/progress.md`, `.qa-harness/PROMPT.md`, and `.qa-harness/normalized.feature` as durable memory.
+- Do not stage, commit, push, or create a pull request.
+- Mark an item complete only after Copilot returns `RALPH_STATUS: pass` and supervisor `ralph-qa-harness verify` passes.
 
 ## Item Template
 
@@ -13,30 +13,20 @@
   - Input: `<single source>`
   - Output: `<single artifact or code change>`
   - Verify: `<single proof step>`
-  - Owner: `<agent>`
-  - Status: `todo`
-  - Retry budget: `2`
-  - Result: ``
-  - Fallback reason: ``
-
-## Active Items
-
-- [ ] `P-001` Goal: verify the stamped run artifacts and generated BDD specs
-  - Input: `<jira ticket or feature path>`, `PRD.md`, `progress.md`, `PROMPT.md`, `normalized.feature`
-  - Output: verifier proof recorded in `logs/verifier.log`
-  - Verify: `npm run qa:orchestrator -- verify-run --run-id <run-id>`
-  - Owner: `qa-verifier`
+  - Worker: `<worker>`
   - Status: `todo`
   - Retry budget: `1`
   - Result: ``
-  - Fallback reason: ``
+  - Evidence: ``
 
-- [ ] `P-002` Goal: execute the generated run-backed scenario on Chromium
-  - Input: `normalized.feature`
-  - Output: runtime proof recorded in `logs/runtime.log`
-  - Verify: `npm run qa:orchestrator -- execute-run --run-id <run-id> --project chromium`
-  - Owner: `qa-executor`
+## Active Items
+
+- [ ] `P-001` Goal: execute the selected feature through Copilot-supervised Playwright BDD verification
+  - Input: `<feature path>`, `.qa-harness/PRD.md`, `.qa-harness/progress.md`, `.qa-harness/PROMPT.md`, `.qa-harness/normalized.feature`
+  - Output: evidence recorded in `.qa-harness/progress.md`
+  - Verify: `ralph-qa-harness verify` passes for run `<run-id>`
+  - Worker: `copilot`
   - Status: `todo`
-  - Retry budget: `2`
+  - Retry budget: `1`
   - Result: ``
-  - Fallback reason: ``
+  - Evidence: ``

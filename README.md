@@ -1,40 +1,39 @@
 # Ralph QA Harness
 
-`ralph-qa-harness` is a standalone npm CLI package for artifact-first browser QA workflows.
+`ralph-qa-harness` is a lean npm CLI for supervised Playwright BDD work. It prepares one feature-backed work item, launches a fresh Copilot CLI process for each bounded worker iteration, verifies generated Playwright BDD output, and records durable evidence in the target project.
 
-It runs an artifact-first QA workflow for Playwright + `playwright-bdd` projects that use the supported layout documented below. The harness keeps the current command surface, keeps verifier review as the boundary before reported `pass`, preserves the runtime worker JSON contract, and keeps append-only logs and reports under `.qa-harness/runs/<run-id>/`.
+The product worker runtime is Copilot CLI. `ralph-codex` and Codex are only used to build this package; they are not the runtime used by `ralph-qa-harness`.
 
 ## Maturity
 
-This is a pragmatic first standalone release, not a broad framework product.
-
 - Status: pilot / supervised use
-- Intended users: operators running supervised Playwright BDD QA workflows
-- Stability goal: reproducible runs against target projects that match the supported Playwright BDD setup
-- Non-goal for v0.1: framework-agnostic abstractions, background autonomy, or broad source-intake redesign
+- Intended users: operators running file-backed Playwright BDD QA workflows
+- Stability goal: reproducible runs against target projects that match the supported layout
+- Non-goals: generic framework support, hidden background autonomy, broad source intake, and multi-role worker topologies
 
 ## Prerequisites
 
 - Node.js 20+
 - npm
+- git
+- Copilot CLI available on `PATH`
 - A target project with:
   - local `@playwright/test`
   - local `playwright-bdd`
-  - a `playwright.config.*`
+  - `playwright.config.*`
   - `Features/**/*.feature`
   - `Features/steps/**/*.ts`
-- Playwright browsers installed for the target project
 
-This package assumes the target project root matches the supported Playwright BDD layout below. That narrow assumption is intentional in v1.
+On Windows, the default product worker command is `copilot.cmd`. On non-Windows platforms, the default command is `copilot`. Operators may override the command in `.qa-harness/config.json` when their environment requires an explicit path or different executable name.
 
 ## Install From Source
 
-Clone this repository, then choose one of these local-dev flows.
+Clone this repository, then choose one local development flow.
 
 Use `npm link`:
 
 ```bash
-cd ralph-qa-harness
+cd /path/to/ralph-qa-harness
 npm link
 cd /path/to/target-project
 ralph-qa-harness doctor
@@ -68,22 +67,9 @@ Then run it from the target project root:
 npx ralph-qa-harness doctor
 ```
 
-## Playwright Setup
-
-From the target project root:
-
-```bash
-npm install --save-dev @playwright/test playwright-bdd
-npx playwright install
-```
-
-If the target project already has those dependencies, only the browser install step may still be required.
-
 ## Target Project Contract
 
-This package does not try to discover or support arbitrary project structures in v1.
-
-Expected target-project layout:
+The harness intentionally supports one narrow Playwright BDD layout:
 
 ```text
 package.json
@@ -96,207 +82,181 @@ Features/
     **/*.ts
 ```
 
-Expected behavior assumptions:
-
-- `playwright-bdd` generates specs from `Features/**/*.feature` and `.qa-harness/runs/**/*.feature`
-- Playwright runs from the target project root
-- Canonical features live under `Features/`
-- Canonical reusable steps live under `Features/steps/`
+Playwright is required for browser/test integration, and `playwright-bdd` is required for executable feature generation. The harness does not provide generic non-Playwright framework support.
 
 ## Quick Start
 
 From the target project root:
 
 ```bash
-npx ralph-qa-harness doctor --project chromium
-npx ralph-qa-harness prepare-run --intent coverage --source-type feature --source-ref Features/homepage.feature --mode guided-exploratory --scope single-feature --constraint "feature: homepage" --constraint "risk area: alternate navigation path" --constraint "iteration budget: 1"
-npx ralph-qa-harness verify-run --run-id <run-id> --project chromium
-npx ralph-qa-harness advance-run --run-id <run-id> --adapter external --project chromium
-```
-
-If you want bounded supervisory looping:
-
-```bash
-npx ralph-qa-harness loop-run --run-id <run-id> --max-iterations 2 --adapter external --project chromium
-```
-
-Review the run artifacts between iterations.
-
-## Doctor / Preflight
-
-`doctor` and `preflight` are aliases.
-
-They validate:
-
-- Node/npm availability
-- local Playwright CLI availability
-- local `playwright-bdd` CLI availability
-- installed Playwright browsers
-- target-project layout
-- optional external runtime override env vars
-- optional Playwright bridge env vars when requested
-- optional base URL / target environment inputs
-
-Examples:
-
-```bash
 npx ralph-qa-harness doctor
-npx ralph-qa-harness doctor --project chromium
-npx ralph-qa-harness preflight --require-bridge true
-npx ralph-qa-harness doctor --adapter external --base-url https://staging.example.com --target-env staging
+npx ralph-qa-harness prepare --from Features/homepage.feature
+npx ralph-qa-harness run --max-iterations 2
+npx ralph-qa-harness status
+npx ralph-qa-harness verify
 ```
 
-## Command Reference
+Review `.qa-harness/progress.md`, `.qa-harness/state.json`, and the latest `.qa-harness/runs/<run-id>/` artifacts between bounded runs.
 
-The operator-facing commands are unchanged:
+## Commands
 
-- `create-run`
-- `prepare-run`
-- `verify-run`
-- `execute-run`
-- `advance-run`
-- `iterate-run`
-- `loop-run`
+The operator-facing command surface is intentionally small:
 
-Examples:
+```text
+ralph-qa-harness doctor
+ralph-qa-harness prepare --from <feature-path>
+ralph-qa-harness run --max-iterations <positive-integer>
+ralph-qa-harness status
+ralph-qa-harness verify
+```
+
+### `doctor`
+
+Checks the target project and reports each check separately as `pass` or `fail`:
+
+- Node runtime
+- npm availability
+- git availability
+- local Playwright package and CLI availability
+- local `playwright-bdd` package and CLI availability
+- supported `Features/` layout
+- Copilot CLI availability through the configured command
+
+`doctor` fails clearly when Copilot CLI is missing. On Windows it checks `copilot.cmd --help` by default; on non-Windows platforms it checks `copilot --help`.
+
+### `prepare --from <feature-path>`
+
+Creates or refreshes `.qa-harness/` for a selected `.feature` file:
+
+- copies the selected feature exactly to `.qa-harness/normalized.feature`
+- writes `.qa-harness/config.json`
+- writes a concise `.qa-harness/PRD.md`
+- writes one bounded unchecked item in `.qa-harness/progress.md`
+- writes stable Copilot worker rules to `.qa-harness/PROMPT.md`
+- records latest prepared state in `.qa-harness/state.json`
+- ensures `.qa-harness/` and `.features-gen/.qa-harness/` are excluded through `.git/info/exclude`
+
+`normalized.feature` is the execution truth for the harness run.
+
+### `run --max-iterations <positive-integer>`
+
+Runs a bounded supervisor loop. Each iteration:
+
+- selects exactly one unchecked item from `.qa-harness/progress.md`
+- builds a worker prompt from `.qa-harness/PRD.md`, `.qa-harness/progress.md`, `.qa-harness/PROMPT.md`, and the selected item
+- launches one fresh Copilot CLI process
+- sends the prompt on stdin
+- captures stdout, stderr, summary, validation, changed files, and diff evidence
+- marks the selected item complete only when Copilot reports `RALPH_STATUS: pass` and supervisor verification passes
+
+Worker output must end with:
+
+```text
+RALPH_STATUS: pass|blocked|fail
+RALPH_SUMMARY: <one concise paragraph>
+RALPH_VALIDATION: <commands run, or why not run>
+RALPH_NEXT: <next recommended action, or none>
+```
+
+Missing or invalid footer output is a terminal worker failure.
+
+### `status`
+
+Reads `.qa-harness/state.json` and run artifacts to print the prepared feature, latest or active run id, terminal status, stop reason, and validation state. It also gives a useful no-run message before `prepare` has been run.
+
+### `verify`
+
+Runs list-time Playwright BDD validation from the target project root:
 
 ```bash
-npx ralph-qa-harness prepare-run --intent plan --source-type feature --source-ref Features/homepage.feature
-npx ralph-qa-harness prepare-run --request "coverage for Features/homepage.feature in guided-exploratory mode"
-npx ralph-qa-harness prepare-run --run-id <run-id>
-npx ralph-qa-harness verify-run --run-id <run-id> --project chromium
-npx ralph-qa-harness execute-run --run-id <run-id> --project chromium --headed true
-npx ralph-qa-harness advance-run --run-id <run-id> --adapter external --project chromium
-npx ralph-qa-harness iterate-run --run-id <run-id> --adapter mock
-npx ralph-qa-harness loop-run --run-id <run-id> --max-iterations 3 --adapter external --project chromium
+npx bddgen export
+npx bddgen test
+npx playwright test --list
 ```
 
-## Execution Controls
+Verification fails if any command exits nonzero, if `bddgen export` reports zero registered steps, if no generated spec can be found for the run-backed feature, or if Playwright lists zero tests. It does not run full browser execution as part of the lean contract.
 
-Supported additive execution-control flags:
-
-- `--project <project>`
-- `--headed <true|false>`
-- `--debug <true|false>`
-- `--base-url <url>`
-- `--target-env <name>`
-- `--trace <mode>`
-- `--video <mode>`
-- `--screenshot <mode>`
-
-These controls are recorded in the run artifacts and reused across later verifier/executor flows within the same run.
+When a run exists, `verify` writes structured output to `.qa-harness/runs/<run-id>/validation.json`.
 
 ## Artifact Layout
 
-Each run writes to the target project:
+Durable runtime state lives under `.qa-harness/` in the target project:
 
 ```text
 .qa-harness/
+  config.json
+  PRD.md
+  progress.md
+  PROMPT.md
+  normalized.feature
+  state.json
   runs/
     <run-id>/
-      PRD.md
-      progress.md
-      PROMPT.md
-      normalized.feature
-      evidence/
-        screenshots/
-        snapshots/
-        traces/
-        videos/
-      logs/
-        runtime.log
-        verifier.log
-        fallback.log
-      outputs/
-        gap-analysis.md
-        planner-handoff.md
-        promotion-report.md
-        scenario-addition.md
-        heal-report.md
-        loop-report.md
+      result.json
+      loop-report.md
+      validation.json
+      diff.patch
+      iterations/
+        <nnn>/
+          worker-prompt.md
+          stdout.log
+          stderr.log
+          summary.json
+          validation.json
+          diff.patch
 ```
 
-History is append-only where the current harness already treats it as history:
+Generated Playwright BDD output may live under `.features-gen/.qa-harness/`. That path is generated output only, not durable supervisor state.
 
-- `logs/*.log`
-- structured reports under `outputs/*.md`
+The target project should exclude both runtime paths through `.git/info/exclude`:
 
-## Env Vars
+```text
+.qa-harness/
+.features-gen/.qa-harness/
+```
 
-User-facing env vars:
+The harness must not add those entries to tracked `.gitignore`.
 
-- `PLAYWRIGHT_BASE_URL`
-  Optional default base URL for execution.
-- `QA_HARNESS_TARGET_ENV`
-  Optional environment label recorded in run artifacts.
-- `QA_HARNESS_EXTERNAL_RUNTIME_CMD`
-  Optional override for the external runtime command. Leave unset to use the bundled external worker.
-- `QA_HARNESS_EXTERNAL_RUNTIME_ARGS`
-  Optional JSON array of extra args for the external runtime command.
-- `QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD`
-  Optional command for the Playwright test/debug bridge.
-- `QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS`
-  Optional JSON array of extra args for the bridge command.
+## Runtime Files
 
-Examples live in [.env.example](.env.example).
-
-## Canonical Promotion
-
-Canonical promotion is preserved in this standalone package under the same target-project setup.
-
-What stays true:
-
-- scenario addition remains bounded and artifact-backed
-- verifier review remains the boundary before `advance-run` reports `pass`
-- promotion only targets canonical `Features/*.feature` content under the target project
-- reusable promotion step generation remains bounded to `Features/steps/promotion-generated.ts`
-- promotion still fails or blocks on ambiguity, drift, conflict markers, or unverifiable step coverage
-
-This package does not silently weaken verifier/runtime boundaries.
-
-## Current Limitations
-
-- Target projects must match the supported Playwright BDD layout documented in this README.
-- Source intake is still intentionally narrow.
-- The harness is still fresh-session and artifact-first; it does not keep hidden conversational state.
-- No pause/resume/background-worker autonomy is included in this slice.
-- `doctor` validates the current supported contract; it is not a generic framework detector.
-- The design doc is still shaped around the current harness contract rather than a broader framework abstraction.
+- `.qa-harness/config.json`
+  Stores product-level configuration, including the Copilot command. It does not store Codex configuration.
+- `.qa-harness/PRD.md`
+  Stores the concise run objective generated from the selected feature path.
+- `.qa-harness/progress.md`
+  Stores bounded checkbox work and is the source used by `run` to select work.
+- `.qa-harness/PROMPT.md`
+  Stores stable Copilot worker rules, including the required footer and the no-stage/no-commit/no-push/no-PR rule.
+- `.qa-harness/normalized.feature`
+  Stores the exact selected feature content used as the execution truth.
+- `.qa-harness/state.json`
+  Stores prepared source path, normalized feature path, latest run id, active run id, terminal status, and enough data for `status`.
+- `.qa-harness/runs/<run-id>/`
+  Stores immutable-ish run evidence and per-iteration artifacts.
 
 ## Supervised Use Expectations
 
-Use this tool as a supervised harness, not as an unsupervised agent runner.
+Use this tool as a supervised harness.
 
-- Review `progress.md`, `logs/runtime.log`, `logs/verifier.log`, and relevant `outputs/*.md` after each bounded step.
-- Treat reported `pass` as valid only after verifier-backed review.
-- Review canonical promotion outcomes before merging promoted feature changes.
-- Keep loop budgets explicit and small during pilot use.
-
-## Roadmap / Next Steps
-
-- Harden portability and burn-in on clean laptops and CI.
-- Add more integration coverage around the real external worker path.
-- Improve operator lifecycle controls without widening autonomy.
-- Revisit broader source intake only after the current target-project contract is stable.
-- Consider broader framework support only after this narrow Playwright BDD package is trusted.
+- Keep iteration budgets explicit and small.
+- Review `.qa-harness/progress.md` and latest run artifacts between runs.
+- Treat a worker `pass` as incomplete until supervisor `verify` passes.
+- Do not stage, commit, push, or create pull requests from inside a harness run.
 
 ## Repository Contents
 
 - `bin/`
   npm CLI entrypoint
 - `scripts/`
-  extracted harness core and runtime adapters
+  harness implementation
 - `templates/`
-  run artifact templates owned by the package
+  prompt and artifact templates owned by the package
 - `docs/`
-  design doc plus standalone packaging notes
-- `examples/`
-  example runtime/demo assets and usage workflow
+  target design and packaging notes
 - `tests/`
-  extracted harness tests plus package-specific CLI and doctor coverage
+  CLI, doctor, package, and harness tests
 
 Additional notes:
 
-- [examples/use-from-another-project.md](examples/use-from-another-project.md)
 - [docs/packaging-notes.md](docs/packaging-notes.md)
 - [docs/copilot-first-qa-ralph-harness.md](docs/copilot-first-qa-ralph-harness.md)

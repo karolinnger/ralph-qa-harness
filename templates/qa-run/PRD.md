@@ -1,4 +1,4 @@
-# QA Run PRD
+# QA Harness PRD
 
 ## Run Summary
 
@@ -6,30 +6,35 @@
 - Intent: `<intent>`
 - Mode: `<mode>`
 - Source type: `<source-type>`
-- Source reference: `<ticket, file, scenario, or run>`
+- Source feature path: `<source feature path>`
 
 ## Objective
 
 Describe the exact QA outcome this run must achieve.
 
-## Normalized Execution Truth
+## Durable Artifacts
 
-- Feature file: `normalized.feature`
-- Primary scenario scope: `<scenario or feature area>`
+- `.qa-harness/PRD.md`: concise run objective for the selected feature.
+- `.qa-harness/progress.md`: bounded work queue and durable evidence.
+- `.qa-harness/PROMPT.md`: stable Copilot worker rules.
+- `.qa-harness/normalized.feature`: execution truth copied from the selected feature.
 
-## Inputs
+## Execution Truth
 
-- Jira input: `<optional>`
-- Feature input: `<optional>`
-- Existing failing scenario: `<optional>`
-- User guidance: `<optional>`
+- Source feature path: `<feature input>`
+- Primary feature or scenario scope: `<scenario or feature area>`
+- Verification uses `.qa-harness/normalized.feature` as the run-backed feature truth.
 
 ## Constraints
 
-- Prefer Playwright CLI first.
-- Use Playwright test/debug second.
-- Use MCP only with explicit fallback reason recorded in `progress.md` and `logs/fallback.log`.
-- Keep work atomic enough for one progress item per iteration.
+- Use Copilot CLI as the product worker runtime.
+- Use Playwright and `playwright-bdd` for executable feature generation and list-time verification.
+- Keep durable state and evidence in `.qa-harness/`.
+- Complete one selected progress item per worker process.
+
+## User Guidance
+
+- `<user guidance>`
 
 ## Success Criteria
 

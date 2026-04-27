@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const ALLOWED_INTENTS = new Set(['plan', 'implement', 'inspect', 'execute', 'heal', 'coverage']);
@@ -42,6 +43,36 @@ const DEFAULT_EXECUTION_CONTROLS = Object.freeze({
   screenshot: 'off',
 });
 const DEFAULT_HARNESS_COMMAND_PREFIX = 'npx ralph-qa-harness';
+const HARNESS_DIR_NAME = '.qa-harness';
+const GENERATED_FEATURES_DIR_NAME = '.features-gen';
+const HARNESS_CONFIG_FILE = 'config.json';
+const HARNESS_PRD_FILE = 'PRD.md';
+const HARNESS_PROGRESS_FILE = 'progress.md';
+const HARNESS_PROMPT_FILE = 'PROMPT.md';
+const HARNESS_NORMALIZED_FEATURE_FILE = 'normalized.feature';
+const HARNESS_STATE_FILE = 'state.json';
+const HARNESS_RUNS_DIR = 'runs';
+const HARNESS_RUN_RESULT_FILE = 'result.json';
+const HARNESS_RUN_LOOP_REPORT_FILE = 'loop-report.md';
+const HARNESS_RUN_VALIDATION_FILE = 'validation.json';
+const HARNESS_RUN_DIFF_FILE = 'diff.patch';
+const HARNESS_RUN_ITERATIONS_DIR = 'iterations';
+const HARNESS_ITERATION_WORKER_PROMPT_FILE = 'worker-prompt.md';
+const HARNESS_ITERATION_STDOUT_FILE = 'stdout.log';
+const HARNESS_ITERATION_STDERR_FILE = 'stderr.log';
+const HARNESS_ITERATION_SUMMARY_FILE = 'summary.json';
+const HARNESS_ITERATION_VALIDATION_FILE = 'validation.json';
+const HARNESS_ITERATION_DIFF_FILE = 'diff.patch';
+const HARNESS_ITERATION_DIFF_MAX_BYTES = 64 * 1024;
+const HARNESS_GIT_EXCLUDE_ENTRIES = Object.freeze([
+  `${HARNESS_DIR_NAME}/`,
+  `${GENERATED_FEATURES_DIR_NAME}/${HARNESS_DIR_NAME}/`,
+]);
+const RALPH_FOOTER_DESCRIPTOR_PLACEHOLDERS = new Set([
+  '<one concise paragraph>',
+  '<commands run, or why not run>',
+  '<next recommended action, or none>',
+]);
 const SUPPORTED_PLAYWRIGHT_CONFIG_FILES = Object.freeze([
   'playwright.config.ts',
   'playwright.config.js',
@@ -77,8 +108,6 @@ const REQUIRED_FILE_KEYS = [
 
 const ACTIONABLE_PROGRESS_STATUSES = new Set(['todo', 'doing', 'fail']);
 const TERMINAL_PROGRESS_STATUSES = new Set(['pass', 'blocked']);
-const RUNTIME_ADAPTER_NAMES = new Set(['mock', 'external']);
-const RUNTIME_RESULT_STATUSES = new Set(['pass', 'fail', 'blocked']);
 const PLAYWRIGHT_RUNTIME_ORDER = Object.freeze(['playwright-cli', 'playwright-test', 'mcp']);
 const PLAYWRIGHT_RUNTIME_LAYERS = new Set(PLAYWRIGHT_RUNTIME_ORDER);
 const GAP_ANALYSIS_ARTIFACT_TITLE = 'Gap Analysis';
@@ -272,6 +301,114 @@ function resolveDisplayPath(repoRoot, targetPath) {
 
 function resolveRunDirDisplay(repoRoot, runPaths) {
   return normalizeDisplayPath(path.relative(repoRoot, runPaths.runDir));
+}
+
+function isPathWithin(parentDir, targetPath) {
+  const relativePath = path.relative(parentDir, targetPath);
+  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function normalizeHarnessRunId(runId) {
+  const value = hasMeaningfulString(runId) ? runId.trim() : '';
+  if (!value) {
+    return '';
+  }
+
+  if (
+    value === '.'
+    || value === '..'
+    || path.isAbsolute(value)
+    || value.includes('/')
+    || value.includes('\\')
+  ) {
+    throw new Error('Run id must be a single path segment under .qa-harness/runs.');
+  }
+
+  return value;
+}
+
+function assertDurableHarnessPaths(paths) {
+  const harnessDir = paths.harnessDir;
+  for (const [key, value] of Object.entries(paths)) {
+    if (key === 'repoRoot' || key === 'runId' || !hasMeaningfulString(value)) {
+      continue;
+    }
+
+    if (!isPathWithin(harnessDir, value)) {
+      throw new Error(`${key} must stay under ${HARNESS_DIR_NAME}.`);
+    }
+  }
+
+  if (hasMeaningfulString(paths.runDir) && !isPathWithin(paths.runsDir, paths.runDir)) {
+    throw new Error('Run id must be a single path segment under .qa-harness/runs.');
+  }
+}
+
+function resolveHarnessPaths(repoRoot, options = {}) {
+  const root = path.resolve(repoRoot);
+  const harnessDir = path.join(root, HARNESS_DIR_NAME);
+  const runsDir = path.join(harnessDir, HARNESS_RUNS_DIR);
+  const runId = normalizeHarnessRunId(options.runId);
+  const runDir = runId ? path.resolve(runsDir, runId) : '';
+  const paths = {
+    repoRoot: root,
+    harnessDir,
+    configPath: path.join(harnessDir, HARNESS_CONFIG_FILE),
+    prdPath: path.join(harnessDir, HARNESS_PRD_FILE),
+    progressPath: path.join(harnessDir, HARNESS_PROGRESS_FILE),
+    promptPath: path.join(harnessDir, HARNESS_PROMPT_FILE),
+    normalizedFeaturePath: path.join(harnessDir, HARNESS_NORMALIZED_FEATURE_FILE),
+    statePath: path.join(harnessDir, HARNESS_STATE_FILE),
+    runsDir,
+  };
+  assertDurableHarnessPaths(paths);
+
+  if (!runId) {
+    return paths;
+  }
+
+  const runPaths = {
+    ...paths,
+    runId,
+    runDir,
+    resultPath: path.join(runDir, HARNESS_RUN_RESULT_FILE),
+    loopReportPath: path.join(runDir, HARNESS_RUN_LOOP_REPORT_FILE),
+    validationPath: path.join(runDir, HARNESS_RUN_VALIDATION_FILE),
+    diffPatchPath: path.join(runDir, HARNESS_RUN_DIFF_FILE),
+    iterationsDir: path.join(runDir, HARNESS_RUN_ITERATIONS_DIR),
+  };
+
+  assertDurableHarnessPaths(runPaths);
+  return runPaths;
+}
+
+function resolveGeneratedHarnessPaths(repoRoot, options = {}) {
+  const root = path.resolve(repoRoot);
+  const generatedDir = path.join(root, GENERATED_FEATURES_DIR_NAME);
+  const generatedHarnessDir = path.join(generatedDir, HARNESS_DIR_NAME);
+  const generatedRunsDir = path.join(generatedHarnessDir, HARNESS_RUNS_DIR);
+  const runId = normalizeHarnessRunId(options.runId);
+  const paths = {
+    repoRoot: root,
+    generatedDir,
+    generatedHarnessDir,
+    generatedRunsDir,
+  };
+
+  if (!runId) {
+    return paths;
+  }
+
+  const generatedRunDir = path.join(generatedRunsDir, runId);
+  if (!isPathWithin(generatedRunsDir, generatedRunDir)) {
+    throw new Error('Run id must be a single path segment under .qa-harness/runs.');
+  }
+
+  return {
+    ...paths,
+    runId,
+    generatedRunDir,
+  };
 }
 
 function formatVerifyRunSummary(result) {
@@ -539,7 +676,8 @@ function clarifyPrepareRunRequest(options) {
 }
 
 function resolveRunPaths(repoRoot, runId) {
-  const runDir = path.join(repoRoot, '.qa-harness', 'runs', runId);
+  const harnessPaths = resolveHarnessPaths(repoRoot, { runId });
+  const runDir = harnessPaths.runDir;
   const evidenceDir = path.join(runDir, 'evidence');
   const logsDir = path.join(runDir, 'logs');
   const outputsDir = path.join(runDir, 'outputs');
@@ -576,6 +714,41 @@ function ensureRunTree(runPaths) {
   }
 }
 
+function ensureHarnessGitInfoExclude(repoRoot) {
+  const gitDir = path.join(path.resolve(repoRoot), '.git');
+  if (!pathExists(gitDir) || !fs.statSync(gitDir).isDirectory()) {
+    return {
+      status: 'skipped',
+      reason: '.git directory not found',
+      entries: HARNESS_GIT_EXCLUDE_ENTRIES,
+    };
+  }
+
+  const gitInfoDir = path.join(gitDir, 'info');
+  const excludePath = path.join(gitInfoDir, 'exclude');
+  const existingContent = pathExists(excludePath) ? readText(excludePath) : '';
+  const existingEntries = new Set(
+    existingContent
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+  const missingEntries = HARNESS_GIT_EXCLUDE_ENTRIES.filter((entry) => !existingEntries.has(entry));
+
+  if (missingEntries.length > 0) {
+    fs.mkdirSync(gitInfoDir, { recursive: true });
+    const separator = existingContent.length === 0 || existingContent.endsWith('\n') ? '' : '\n';
+    fs.appendFileSync(excludePath, `${separator}${missingEntries.join('\n')}\n`, 'utf8');
+  }
+
+  return {
+    status: missingEntries.length > 0 ? 'updated' : 'unchanged',
+    excludePath,
+    entries: HARNESS_GIT_EXCLUDE_ENTRIES,
+    addedEntries: missingEntries,
+  };
+}
+
 function stampPrdTemplate(template, data) {
   let content = template;
 
@@ -583,13 +756,11 @@ function stampPrdTemplate(template, data) {
   content = replaceOnce(content, '<intent>', data.intent, 'PRD.md');
   content = replaceOnce(content, '<mode>', data.mode, 'PRD.md');
   content = replaceOnce(content, '<source-type>', data.sourceType, 'PRD.md');
-  content = replaceOnce(content, '<ticket, file, scenario, or run>', data.sourceRefDisplay, 'PRD.md');
+  content = replaceOnce(content, '<source feature path>', data.sourceRefDisplay, 'PRD.md');
   content = replaceOnce(content, 'Describe the exact QA outcome this run must achieve.', data.objective, 'PRD.md');
+  content = replaceOnce(content, '<feature input>', data.sourceRefDisplay, 'PRD.md');
   content = replaceOnce(content, '<scenario or feature area>', data.primaryScenarioScope, 'PRD.md');
-  content = replaceOnce(content, '<optional>', 'not provided', 'PRD.md');
-  content = replaceOnce(content, '<optional>', data.sourceRefDisplay, 'PRD.md');
-  content = replaceOnce(content, '<optional>', 'not provided', 'PRD.md');
-  content = replaceOnce(content, '<optional>', data.userGuidance, 'PRD.md');
+  content = replaceOnce(content, '<user guidance>', data.userGuidance, 'PRD.md');
   content = replaceOnce(content, '<criterion 1>', data.successCriteria[0], 'PRD.md');
   content = replaceOnce(content, '<criterion 2>', data.successCriteria[1], 'PRD.md');
   content = replaceOnce(content, '<criterion 3>', data.successCriteria[2], 'PRD.md');
@@ -601,7 +772,7 @@ function stampPrdTemplate(template, data) {
   content = replaceOnce(content, '<snapshot, trace, output, scenario pass>', data.verification.evidence, 'PRD.md');
 
   if (data.constraints.length > 0) {
-    const marker = '- Keep work atomic enough for one progress item per iteration.';
+    const marker = '- Complete one selected progress item per worker process.';
     const injectedConstraints = data.constraints.map((constraint) => `- User constraint: ${constraint}`).join('\n');
     content = replaceOnce(content, marker, `${marker}\n${injectedConstraints}`, 'PRD.md');
   }
@@ -625,13 +796,12 @@ function stampProgressTemplate(template, data) {
 
   content = content.replace(/npm run qa:orchestrator --/g, getHarnessCommandPrefix());
   content = replaceOnce(content, '<run-id>', data.runId, 'progress.md');
-  content = replaceOnce(content, '<run-id>', data.runId, 'progress.md');
   content = replaceOnce(content, '<small atomic goal>', 'one small, verifiable goal', 'progress.md');
   content = replaceOnce(content, '<single source>', 'one source artifact', 'progress.md');
   content = replaceOnce(content, '<single artifact or code change>', 'one artifact or code change', 'progress.md');
   content = replaceOnce(content, '<single proof step>', 'one proof step', 'progress.md');
-  content = replaceOnce(content, '<agent>', 'qa-agent', 'progress.md');
-  content = replaceOnce(content, '<jira ticket or feature path>', data.sourceRefDisplay, 'progress.md');
+  content = replaceOnce(content, '<worker>', 'copilot', 'progress.md');
+  content = replaceOnce(content, '<feature path>', data.sourceRefDisplay, 'progress.md');
 
   return content;
 }
@@ -645,6 +815,7 @@ function createRun(options) {
   const runId = createRunId(options.now || new Date(), request.intent, request.sourceRefDisplay);
   const runPaths = resolveRunPaths(repoRoot, runId);
 
+  ensureHarnessGitInfoExclude(repoRoot);
   ensureRunTree(runPaths);
 
   const prdTemplate = readText(path.join(templatesDir, 'PRD.md'));
@@ -659,44 +830,24 @@ function createRun(options) {
     sourceRefDisplay: request.sourceRefDisplay,
     primaryScenarioScope: featureMetadata.featureTitle,
     constraints: request.constraints,
-    objective: `Prepare and execute a feature-backed QA harness run for ${request.sourceRefDisplay} so the verifier can prove the artifact set is complete and the executor can prove one generated scenario passes on Chromium.`,
+    objective: `Prepare a feature-backed QA harness run for ${request.sourceRefDisplay} using .qa-harness/normalized.feature as the execution truth and supervisor verification as the completion proof.`,
     userGuidance: request.constraints.length > 0 ? request.constraints.join('; ') : 'not provided',
     successCriteria: [
-      `normalized.feature preserves the source feature from ${request.sourceRefDisplay} for this bootstrap slice.`,
-      `Verification succeeds via ${buildHarnessCommandDescription('verify-run', { runId })}.`,
-      `Execution succeeds via ${buildHarnessCommandDescription('execute-run', {
-        runId,
-        executionControls: {
-          shouldPersist: false,
-          controls: {
-            ...DEFAULT_EXECUTION_CONTROLS,
-            project: 'chromium',
-          },
-        },
-        includeProject: true,
-      })}, with runtime proof recorded in logs/runtime.log.`,
+      `.qa-harness/normalized.feature preserves the source feature from ${request.sourceRefDisplay}.`,
+      'Copilot receives one selected item from .qa-harness/progress.md and returns the required Ralph footer.',
+      'Supervisor verification succeeds via ralph-qa-harness verify without full browser execution.',
     ],
     outOfScope: [
-      'Jira ingestion, scenario extraction, and non-feature source normalization are deferred.',
-      'Fresh-session loop orchestration, healing automation, and exploratory coverage expansion are deferred.',
+      'Non-feature source intake is outside the lean template contract.',
+      'Full browser execution is outside the lean verification contract.',
     ],
     knownGaps: [
-      'Feature normalization is identity-only in this slice.',
-      'Execution is limited to generated Playwright specs; there is no autonomous Ralph loop yet.',
+      'Feature normalization is identity-only unless a later selected item changes it.',
+      'Verification is list-time proof against generated run-backed specs.',
     ],
     verification: {
-      command: buildHarnessCommandDescription('execute-run', {
-        runId,
-        executionControls: {
-          shouldPersist: false,
-          controls: {
-            ...DEFAULT_EXECUTION_CONTROLS,
-            project: 'chromium',
-          },
-        },
-        includeProject: true,
-      }),
-      evidence: 'verifier log, runtime log, generated Playwright specs, Playwright pass output',
+      command: 'ralph-qa-harness verify',
+      evidence: 'structured validation output and listed generated tests',
     },
   });
 
@@ -730,6 +881,1244 @@ function createRun(options) {
     runPaths,
     featureMetadata,
   };
+}
+
+function resolveDefaultCopilotCommand(platform = process.platform) {
+  return platform === 'win32' ? 'copilot.cmd' : 'copilot';
+}
+
+function buildLeanPreparePrd(sourceDisplayPath, featureMetadata) {
+  const featureTitle = featureMetadata.featureTitle || path.basename(sourceDisplayPath, '.feature');
+  const scenarioCount = Number.isInteger(featureMetadata.scenarioCount) ? featureMetadata.scenarioCount : 0;
+  const scenarioLabel = `${scenarioCount} scenario${scenarioCount === 1 ? '' : 's'}`;
+
+  return [
+    '# QA Harness PRD',
+    '',
+    `Source feature path: \`${sourceDisplayPath}\``,
+    `Feature title: ${featureTitle}`,
+    `Scenario count: ${scenarioLabel}`,
+    '',
+    '## Objective',
+    '',
+    'Execute or improve the selected feature through Copilot-supervised Playwright BDD.',
+    '',
+    '## Execution Truth',
+    '',
+    '`normalized.feature` is the execution truth for this harness run.',
+    '',
+    '## Required Layers',
+    '',
+    '- Playwright is required for browser/test execution.',
+    '- `playwright-bdd` is required for executable feature generation.',
+    '',
+  ].join('\n');
+}
+
+function buildLeanPrepareProgress(sourceDisplayPath) {
+  return [
+    '# Ralph QA Harness Progress',
+    '',
+    '## Active Items',
+    '',
+    `- [ ] \`P-001\` Goal: execute \`${sourceDisplayPath}\` through Copilot-supervised Playwright BDD verification.`,
+    `  - Input: \`${sourceDisplayPath}\` and \`.qa-harness/normalized.feature\``,
+    '  - Output: Copilot evidence recorded in `.qa-harness/runs/<run-id>/iterations/<nnn>/` and `.qa-harness/progress.md`.',
+    '  - Verify: `ralph-qa-harness verify` passes and lists generated run-backed tests.',
+    '  - Owner: `copilot`',
+    '  - Status: `todo`',
+    '  - Retry budget: `1`',
+    '  - Result: ``',
+    '  - Evidence: ``',
+    '',
+  ].join('\n');
+}
+
+function buildLeanPreparePrompt() {
+  return [
+    '# Copilot Worker Rules',
+    '',
+    '- Complete exactly one selected unchecked item from `.qa-harness/progress.md` per Copilot process.',
+    '- Use `.qa-harness/PRD.md` as the durable objective.',
+    '- Use `.qa-harness/progress.md` as durable progress.',
+    '- Use `.qa-harness/PROMPT.md` as durable worker rules.',
+    '- Use `.qa-harness/normalized.feature` as execution truth.',
+    '- Use `.qa-harness/` files as durable memory.',
+    '- Do not stage, commit, push, or create a pull request.',
+    '- Keep durable harness state in `.qa-harness/`.',
+    '- The supervisor will run `ralph-qa-harness verify` after worker exit.',
+    '',
+    'Every response must end with this exact four-line Ralph footer:',
+    '',
+    'RALPH_STATUS: pass|blocked|fail',
+    'RALPH_SUMMARY: <one concise paragraph>',
+    'RALPH_VALIDATION: <commands run, or why not run>',
+    'RALPH_NEXT: <next recommended action, or none>',
+    '',
+  ].join('\n');
+}
+
+function prepare(options = {}) {
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
+  const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
+  const sourceRef = hasMeaningfulString(options.from) ? options.from.trim() : '';
+
+  if (!sourceRef) {
+    throw new Error('Missing required option --from for prepare.');
+  }
+
+  const sourcePath = path.resolve(repoRoot, sourceRef);
+  if (path.extname(sourcePath).toLowerCase() !== '.feature') {
+    throw new Error(`prepare --from requires a .feature file: ${normalizeDisplayPath(sourceRef)}.`);
+  }
+
+  if (!pathExists(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+    throw new Error(`Feature file not found: ${normalizeDisplayPath(sourceRef)}.`);
+  }
+
+  const sourceDisplayPath = resolveDisplayPath(repoRoot, sourcePath);
+  const featureContent = readText(sourcePath);
+  const featureMetadata = parseFeatureMetadata(featureContent, sourceDisplayPath);
+  const preparedAt = (options.now instanceof Date ? options.now : new Date()).toISOString();
+
+  ensureHarnessGitInfoExclude(repoRoot);
+  fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
+
+  writeText(
+    harnessPaths.configPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      copilot: {
+        command: resolveDefaultCopilotCommand(options.platform || process.platform),
+      },
+    }, null, 2)}\n`,
+  );
+  writeText(harnessPaths.prdPath, buildLeanPreparePrd(sourceDisplayPath, featureMetadata));
+  writeText(harnessPaths.progressPath, buildLeanPrepareProgress(sourceDisplayPath));
+  writeText(harnessPaths.promptPath, buildLeanPreparePrompt());
+  writeText(harnessPaths.normalizedFeaturePath, featureContent);
+  writeText(
+    harnessPaths.statePath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      sourceFeaturePath: sourceDisplayPath,
+      normalizedFeaturePath: `${HARNESS_DIR_NAME}/${HARNESS_NORMALIZED_FEATURE_FILE}`,
+      preparedAt,
+      latestRunId: null,
+      activeRunId: null,
+      terminalStatus: null,
+    }, null, 2)}\n`,
+  );
+
+  return {
+    status: 'pass',
+    sourceFeaturePath: sourceDisplayPath,
+    output: `Prepared ${sourceDisplayPath} in ${HARNESS_DIR_NAME}.\n`,
+  };
+}
+
+function readHarnessState(harnessPaths) {
+  if (!pathExists(harnessPaths.statePath) || !fs.statSync(harnessPaths.statePath).isFile()) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(readText(harnessPaths.statePath));
+  } catch (error) {
+    throw new Error(
+      `Unable to read ${HARNESS_DIR_NAME}/${HARNESS_STATE_FILE}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+function writeHarnessState(harnessPaths, state) {
+  fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
+  writeText(harnessPaths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function formatOptionalStateValue(value, fallback) {
+  return hasMeaningfulString(value) ? value : fallback;
+}
+
+function readOptionalJsonFile(filePath, displayPath) {
+  if (!pathExists(filePath) || !fs.statSync(filePath).isFile()) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(readText(filePath));
+  } catch (error) {
+    throw new Error(
+      `Unable to read ${displayPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function getLatestLeanIterationLabel(runPaths, result) {
+  const iterationNumbers = [];
+
+  if (result && Number.isInteger(result.iterationCount) && result.iterationCount > 0) {
+    iterationNumbers.push(result.iterationCount);
+  }
+
+  if (pathExists(runPaths.iterationsDir) && fs.statSync(runPaths.iterationsDir).isDirectory()) {
+    for (const entry of fs.readdirSync(runPaths.iterationsDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && /^\d+$/.test(entry.name)) {
+        iterationNumbers.push(Number(entry.name));
+      }
+    }
+  }
+
+  if (iterationNumbers.length === 0) {
+    return 'none';
+  }
+
+  return String(Math.max(...iterationNumbers)).padStart(3, '0');
+}
+
+function readLeanStatusRunDetails(repoRoot, state) {
+  const runId = hasMeaningfulString(state.activeRunId) ? state.activeRunId : state.latestRunId;
+  if (!hasMeaningfulString(runId)) {
+    return null;
+  }
+
+  const runPaths = resolveHarnessPaths(repoRoot, { runId });
+  const result = readOptionalJsonFile(
+    runPaths.resultPath,
+    `${HARNESS_DIR_NAME}/runs/${runId}/result.json`,
+  );
+  const validation = readOptionalJsonFile(
+    runPaths.validationPath,
+    `${HARNESS_DIR_NAME}/runs/${runId}/validation.json`,
+  );
+  const runStatus = hasMeaningfulString(state.activeRunId)
+    ? 'active'
+    : formatOptionalStateValue(result && result.status, formatOptionalStateValue(state.terminalStatus, 'not run'));
+
+  return {
+    runId,
+    runStatus,
+    stopReason: formatOptionalStateValue(result && result.stopReason, 'not recorded'),
+    validationStatus: formatOptionalStateValue(validation && validation.status, 'not recorded'),
+    validationPathDisplay: `${HARNESS_DIR_NAME}/runs/${runId}/validation.json`,
+    iterationLabel: getLatestLeanIterationLabel(runPaths, result),
+  };
+}
+
+function status(options = {}) {
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
+  const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
+  const state = readHarnessState(harnessPaths);
+
+  if (!state) {
+    return {
+      status: 'pass',
+      output: [
+        'Status: no-run',
+        `No prepared QA harness state found at ${HARNESS_DIR_NAME}/${HARNESS_STATE_FILE}.`,
+        `Next: ${getHarnessCommandPrefix()} prepare --from <feature-path>`,
+        '',
+      ].join('\n'),
+    };
+  }
+
+  const runDetails = readLeanStatusRunDetails(repoRoot, state);
+  const outputLines = [
+    `Prepared feature: ${formatOptionalStateValue(state.sourceFeaturePath, 'unknown')}`,
+    `Normalized feature: ${formatOptionalStateValue(state.normalizedFeaturePath, `${HARNESS_DIR_NAME}/${HARNESS_NORMALIZED_FEATURE_FILE}`)}`,
+    `Prepared at: ${formatOptionalStateValue(state.preparedAt, 'unknown')}`,
+    `Latest run: ${formatOptionalStateValue(state.latestRunId, 'none')}`,
+    `Active run: ${formatOptionalStateValue(state.activeRunId, 'none')}`,
+    `Terminal status: ${formatOptionalStateValue(state.terminalStatus, 'not run')}`,
+  ];
+
+  if (runDetails) {
+    outputLines.push(
+      `Run id: ${runDetails.runId}`,
+      `Run status: ${runDetails.runStatus}`,
+      `Current/last iteration: ${runDetails.iterationLabel}`,
+      `Stop reason: ${runDetails.stopReason}`,
+      `Validation status: ${runDetails.validationStatus}`,
+      `Validation artifact: ${runDetails.validationPathDisplay}`,
+    );
+  }
+
+  outputLines.push(`Next: ${getHarnessCommandPrefix()} run --max-iterations <positive-integer>`, '');
+
+  return {
+    status: 'pass',
+    output: outputLines.join('\n'),
+  };
+}
+
+function getLeanRunExitCode(status) {
+  return ['failed', 'blocked', 'stalled'].includes(status) ? 1 : 0;
+}
+
+function buildLeanRunResultOutput(runId, iterationCount, status, stopReason) {
+  return `Run ${runId} stopped after ${iterationCount} iterations: ${status}; stop reason: ${stopReason}.\n`;
+}
+
+function classifyLeanFooterStopReason(footerError) {
+  if (/^Missing required footer field /i.test(footerError || '')) {
+    return 'missing-footer';
+  }
+
+  return 'invalid-footer';
+}
+
+function describeLeanRunStop(status, stopReason) {
+  const summaries = {
+    blocked: 'The Copilot worker reported RALPH_STATUS: blocked.',
+    'budget-exhausted': 'Budget was exhausted before all progress items completed.',
+    'invalid-footer': 'The Copilot worker returned an invalid Ralph footer.',
+    'missing-footer': 'The Copilot worker did not return the required Ralph footer.',
+    'no-actionable-items': 'No unchecked actionable progress item remains.',
+    'selected-item-not-completed': 'The selected progress item was not completed after a pass footer and supervisor verify pass.',
+    'validation-failed': 'Supervisor verification failed after the worker reported pass.',
+    'worker-exit-nonzero': 'The Copilot worker process exited nonzero.',
+    'worker-failed': 'The Copilot worker reported RALPH_STATUS: fail.',
+  };
+
+  return summaries[stopReason] || `The run stopped with terminal status ${status}.`;
+}
+
+function buildLeanRunResultRecord(runId, status, stopReason, iterationCount, iterations) {
+  return {
+    schemaVersion: 1,
+    runId,
+    status,
+    stopReason,
+    exitCode: getLeanRunExitCode(status),
+    iterationCount,
+    iterations,
+    finishedAt: new Date().toISOString(),
+  };
+}
+
+function buildLeanLoopReport(result) {
+  const lines = [
+    '# QA Harness Loop Report',
+    '',
+    `Run id: ${result.runId}`,
+    `Final status: ${result.status}`,
+    `Stop reason: ${result.stopReason}`,
+    `Iterations: ${result.iterationCount}`,
+    `Exit code: ${result.exitCode}`,
+    '',
+    'Operator summary:',
+    describeLeanRunStop(result.status, result.stopReason),
+  ];
+  const lastIteration = Array.isArray(result.iterations) && result.iterations.length > 0
+    ? result.iterations[result.iterations.length - 1]
+    : null;
+
+  if (lastIteration) {
+    lines.push('', 'Last iteration:');
+    lines.push(`- Iteration: ${lastIteration.iteration}`);
+    lines.push(`- Worker exit code: ${lastIteration.exitCode}`);
+    if (lastIteration.footerError) {
+      lines.push(`- Footer error: ${lastIteration.footerError}`);
+    }
+    if (lastIteration.footer && hasMeaningfulString(lastIteration.footer.status)) {
+      lines.push(`- Footer status: ${lastIteration.footer.status}`);
+    }
+    if (lastIteration.footer && hasMeaningfulString(lastIteration.footer.summary)) {
+      lines.push(`- Footer summary: ${lastIteration.footer.summary}`);
+    }
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function writeLeanRunTerminalArtifacts(repoRoot, runId, result) {
+  const runPaths = resolveHarnessPaths(repoRoot, { runId });
+  fs.mkdirSync(runPaths.runDir, { recursive: true });
+  writeText(runPaths.resultPath, `${JSON.stringify(result, null, 2)}\n`);
+  writeText(runPaths.loopReportPath, buildLeanLoopReport(result));
+}
+
+function normalizeWorkerCommandResult(result) {
+  return {
+    exitCode: normalizeCommandExitCode(result),
+    stdout: result && typeof result.stdout === 'string' ? result.stdout : '',
+    stderr: result && typeof result.stderr === 'string' ? result.stderr : '',
+  };
+}
+
+function resolveLeanIterationPaths(runPaths, iteration) {
+  const iterationDirectoryName = String(parsePositiveIntegerOption(iteration, 'iteration')).padStart(3, '0');
+  const iterationDir = path.join(runPaths.iterationsDir, iterationDirectoryName);
+  return {
+    iterationDirectoryName,
+    iterationDir,
+    workerPromptPath: path.join(iterationDir, HARNESS_ITERATION_WORKER_PROMPT_FILE),
+    stdoutLogPath: path.join(iterationDir, HARNESS_ITERATION_STDOUT_FILE),
+    stderrLogPath: path.join(iterationDir, HARNESS_ITERATION_STDERR_FILE),
+    summaryPath: path.join(iterationDir, HARNESS_ITERATION_SUMMARY_FILE),
+    validationPath: path.join(iterationDir, HARNESS_ITERATION_VALIDATION_FILE),
+    diffPatchPath: path.join(iterationDir, HARNESS_ITERATION_DIFF_FILE),
+  };
+}
+
+function shouldSkipIterationSnapshotDirectory(repoRoot, directoryPath) {
+  const relativePath = normalizeDisplayPath(path.relative(repoRoot, directoryPath));
+  return (
+    relativePath === '.git'
+    || relativePath.startsWith('.git/')
+    || relativePath === 'node_modules'
+    || relativePath.startsWith('node_modules/')
+    || relativePath === '.ralph'
+    || relativePath.startsWith('.ralph/')
+    || relativePath === `${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}`
+    || relativePath.startsWith(`${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/`)
+  );
+}
+
+function readIterationSnapshotFile(repoRoot, filePath) {
+  const stats = fs.statSync(filePath);
+  const relativePath = normalizeDisplayPath(path.relative(repoRoot, filePath));
+  const baseState = {
+    path: relativePath,
+    absolutePath: filePath,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+  };
+
+  if (stats.size > HARNESS_ITERATION_DIFF_MAX_BYTES) {
+    return {
+      ...baseState,
+      kind: 'oversized',
+      signature: `oversized:${stats.size}:${stats.mtimeMs}`,
+    };
+  }
+
+  const content = fs.readFileSync(filePath);
+  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  const isBinary = content.includes(0);
+  return {
+    ...baseState,
+    kind: isBinary ? 'binary' : 'text',
+    signature: hash,
+    content: isBinary ? null : content.toString('utf8'),
+  };
+}
+
+function captureIterationSnapshot(repoRoot) {
+  const root = path.resolve(repoRoot);
+  const snapshot = new Map();
+
+  function visit(directoryPath) {
+    if (!pathExists(directoryPath) || shouldSkipIterationSnapshotDirectory(root, directoryPath)) {
+      return;
+    }
+
+    for (const entry of fs.readdirSync(directoryPath, { withFileTypes: true })) {
+      const entryPath = path.join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        visit(entryPath);
+      } else if (entry.isFile()) {
+        const fileState = readIterationSnapshotFile(root, entryPath);
+        snapshot.set(fileState.path, fileState);
+      }
+    }
+  }
+
+  visit(root);
+  return snapshot;
+}
+
+function compareIterationSnapshots(beforeSnapshot, afterSnapshot) {
+  const paths = new Set([...beforeSnapshot.keys(), ...afterSnapshot.keys()]);
+  const changes = [];
+
+  for (const filePath of [...paths].sort()) {
+    const before = beforeSnapshot.get(filePath) || null;
+    const after = afterSnapshot.get(filePath) || null;
+    if (before && after && before.signature === after.signature) {
+      continue;
+    }
+
+    const status = before && after ? 'modified' : before ? 'deleted' : 'added';
+    changes.push({
+      path: filePath,
+      status,
+      before,
+      after,
+    });
+  }
+
+  return changes;
+}
+
+function formatChangedFiles(changes) {
+  return changes.map((change) => ({
+    path: change.path,
+    status: change.status,
+    size: change.after ? change.after.size : 0,
+  }));
+}
+
+function prefixDiffLines(prefix, content) {
+  if (!content) {
+    return [];
+  }
+
+  return content
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter((line, index, lines) => index < lines.length - 1 || line.length > 0)
+    .map((line) => `${prefix}${line}`);
+}
+
+function buildTextDiff(change) {
+  const beforeContent = change.before && change.before.kind === 'text' ? change.before.content : '';
+  const afterContent = change.after && change.after.kind === 'text' ? change.after.content : '';
+  return [
+    `diff --git a/${change.path} b/${change.path}`,
+    `--- a/${change.path}`,
+    `+++ b/${change.path}`,
+    '@@',
+    ...prefixDiffLines('-', beforeContent),
+    ...prefixDiffLines('+', afterContent),
+    '',
+  ];
+}
+
+function buildOmittedDiff(change, reason) {
+  return [
+    `diff --git a/${change.path} b/${change.path}`,
+    `--- a/${change.path}`,
+    `+++ b/${change.path}`,
+    `@@ ${reason}`,
+    '',
+  ];
+}
+
+function buildIterationDiffPatch(changes) {
+  if (changes.length === 0) {
+    return 'No worker file changes detected for this iteration.\n';
+  }
+
+  const lines = [];
+  for (const change of changes) {
+    const states = [change.before, change.after].filter(Boolean);
+    if (states.some((state) => state.kind === 'binary')) {
+      lines.push(...buildOmittedDiff(change, '[binary file omitted]'));
+    } else if (states.some((state) => state.kind === 'oversized')) {
+      lines.push(...buildOmittedDiff(
+        change,
+        `[diff omitted: file exceeds ${HARNESS_ITERATION_DIFF_MAX_BYTES} bytes]`,
+      ));
+    } else {
+      lines.push(...buildTextDiff(change));
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function parseWorkerFooter(output) {
+  const footer = {};
+  const fields = [
+    ['status', 'RALPH_STATUS', /^RALPH_STATUS:\s*(.*)$/m],
+    ['summary', 'RALPH_SUMMARY', /^RALPH_SUMMARY:\s*(.*)$/m],
+    ['validation', 'RALPH_VALIDATION', /^RALPH_VALIDATION:\s*(.*)$/m],
+    ['next', 'RALPH_NEXT', /^RALPH_NEXT:\s*(.*)$/m],
+  ];
+
+  for (const [key, label, pattern] of fields) {
+    const match = output.match(pattern);
+    const value = match ? match[1].trim() : '';
+    if (!value) {
+      return {
+        footer,
+        error: `Missing required footer field ${label}.`,
+      };
+    }
+    footer[key] = value;
+  }
+
+  if (!['pass', 'blocked', 'fail'].includes(footer.status)) {
+    return {
+      footer,
+      error: `Invalid RALPH_STATUS "${footer.status}"; expected pass, blocked, or fail.`,
+    };
+  }
+
+  return {
+    footer,
+    error: null,
+  };
+}
+
+function writeLeanIterationArtifacts(iterationPaths, summary, diffPatch) {
+  writeText(iterationPaths.stdoutLogPath, summary.stdout);
+  writeText(iterationPaths.stderrLogPath, summary.stderr);
+  writeText(iterationPaths.summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
+  writeText(iterationPaths.diffPatchPath, diffPatch);
+}
+
+function writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, verifyResult, options = {}) {
+  if (!iterationPaths) {
+    return;
+  }
+
+  const runId = hasMeaningfulString(verifyResult && verifyResult.runId)
+    ? verifyResult.runId
+    : hasMeaningfulString(options.runId)
+      ? normalizeHarnessRunId(options.runId)
+      : '';
+  const baseRecord = verifyResult && hasMeaningfulString(verifyResult.status)
+    ? buildLeanValidationRecord(repoRoot, {
+      ...verifyResult,
+      runId,
+    })
+    : {
+      status: 'skipped',
+      runId,
+      exitCode: null,
+      exportedStepCount: null,
+      listedTestCount: null,
+      generatedSpecs: [],
+      commands: [],
+      reason: options.reason || 'Supervisor verification was not run for this iteration.',
+    };
+  const validationRecord = {
+    ...baseRecord,
+    iteration,
+  };
+  writeText(iterationPaths.validationPath, `${JSON.stringify(validationRecord, null, 2)}\n`);
+}
+
+function readRequiredLeanArtifact(filePath, displayPath) {
+  if (!pathExists(filePath) || !fs.statSync(filePath).isFile()) {
+    throw new Error(`Required harness artifact is missing: ${displayPath}.`);
+  }
+
+  return readText(filePath);
+}
+
+function buildLeanWorkerPrompt(options) {
+  const selectedItemBlock = options.selectedItem.block.trimEnd();
+
+  return [
+    '# Copilot Worker Prompt',
+    '',
+    '## Durable PRD: `.qa-harness/PRD.md`',
+    '',
+    '```markdown',
+    options.prdContent.trimEnd(),
+    '```',
+    '',
+    '## Durable Progress: `.qa-harness/progress.md`',
+    '',
+    '```markdown',
+    options.progressContent.trimEnd(),
+    '```',
+    '',
+    '## Durable Worker Rules: `.qa-harness/PROMPT.md`',
+    '',
+    '```markdown',
+    options.promptContent.trimEnd(),
+    '```',
+    '',
+    '## Selected Progress Item',
+    '',
+    '```markdown',
+    selectedItemBlock,
+    '```',
+    '',
+    '## Required Footer',
+    '',
+    'RALPH_STATUS: pass|blocked|fail',
+    'RALPH_SUMMARY: <one concise paragraph>',
+    'RALPH_VALIDATION: <commands run, or why not run>',
+    'RALPH_NEXT: <next recommended action, or none>',
+    '',
+  ].join('\n');
+}
+
+function writeLeanWorkerPrompt(runPaths, iteration) {
+  const prdContent = readRequiredLeanArtifact(runPaths.prdPath, `${HARNESS_DIR_NAME}/${HARNESS_PRD_FILE}`);
+  const progressContent = readRequiredLeanArtifact(runPaths.progressPath, `${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}`);
+  const promptContent = readRequiredLeanArtifact(runPaths.promptPath, `${HARNESS_DIR_NAME}/${HARNESS_PROMPT_FILE}`);
+  const selectedItem = findNextActionableProgressItem(progressContent);
+
+  if (!selectedItem) {
+    throw new Error(`No unchecked actionable item found in ${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}.`);
+  }
+
+  const iterationPaths = resolveLeanIterationPaths(runPaths, iteration);
+  const workerPrompt = buildLeanWorkerPrompt({
+    prdContent,
+    progressContent,
+    promptContent,
+    selectedItem,
+  });
+  fs.mkdirSync(iterationPaths.iterationDir, { recursive: true });
+  writeText(iterationPaths.workerPromptPath, workerPrompt);
+
+  return {
+    ...iterationPaths,
+    selectedItem,
+    workerPrompt,
+  };
+}
+
+function hasLeanActionableProgressItem(runPaths) {
+  const progressContent = readRequiredLeanArtifact(runPaths.progressPath, `${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}`);
+  return Boolean(findNextActionableProgressItem(progressContent));
+}
+
+function updateLeanSelectedProgressItem(runPaths, selectedItem, status, resultText) {
+  if (!selectedItem || !selectedItem.id) {
+    return;
+  }
+
+  upsertProgressItemResult(runPaths.progressPath, {
+    itemId: selectedItem.id,
+    status,
+    resultText,
+  });
+}
+
+function isLeanSelectedProgressItemCompleted(runPaths, selectedItem) {
+  if (!selectedItem || !selectedItem.id) {
+    return false;
+  }
+
+  const progressContent = readText(runPaths.progressPath);
+  const item = findProgressItem(progressContent, (candidate) => candidate.id === selectedItem.id);
+  return Boolean(item && item.checkboxChecked && item.status === 'pass');
+}
+
+function finishLeanRun(harnessPaths, startedState, status, iterationCount, runId, iterations, options = {}) {
+  const stopReason = options.stopReason || status;
+  const result = buildLeanRunResultRecord(runId, status, stopReason, iterationCount, iterations);
+  writeHarnessState(harnessPaths, {
+    ...startedState,
+    activeRunId: null,
+    terminalStatus: status,
+  });
+  writeLeanRunTerminalArtifacts(harnessPaths.repoRoot, runId, result);
+
+  return {
+    status,
+    exitCode: result.exitCode,
+    runId,
+    iterationCount,
+    iterations,
+    stopReason,
+    output: buildLeanRunResultOutput(runId, iterationCount, status, stopReason),
+  };
+}
+
+function runLeanSupervisorVerify(verifyFn, options) {
+  try {
+    return verifyFn(options);
+  } catch (error) {
+    return {
+      status: 'fail',
+      exitCode: 1,
+      output: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function run(options = {}) {
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
+  const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
+  const maxIterations = parsePositiveIntegerOption(options.maxIterations, 'maxIterations');
+  const state = readHarnessState(harnessPaths);
+
+  if (!state) {
+    return {
+      status: 'fail',
+      exitCode: 1,
+      output: [
+        `No prepared QA harness state found at ${HARNESS_DIR_NAME}/${HARNESS_STATE_FILE}.`,
+        `Next: ${getHarnessCommandPrefix()} prepare --from <feature-path>`,
+        '',
+      ].join('\n'),
+    };
+  }
+
+  const runId = createRunId(options.now || new Date(), 'run', state.sourceFeaturePath || 'harness');
+  const runPaths = resolveHarnessPaths(repoRoot, { runId });
+  const copilotCommand =
+    readConfiguredCopilotCommand(repoRoot)
+    || resolveDefaultCopilotCommand(options.platform || process.platform);
+  const commandRunner = options.commandRunner || runCommand;
+  const env = options.env || process.env;
+  const verifyFn = options.verifyFn || verify;
+  const startedState = {
+    ...state,
+    latestRunId: runId,
+    activeRunId: runId,
+    terminalStatus: null,
+  };
+  const iterations = [];
+
+  fs.mkdirSync(runPaths.iterationsDir, { recursive: true });
+  writeHarnessState(harnessPaths, startedState);
+
+  for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
+    if (!hasLeanActionableProgressItem(runPaths)) {
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'completed',
+        iterations.length,
+        runId,
+        iterations,
+        { stopReason: 'no-actionable-items' },
+      );
+    }
+
+    let commandResult;
+    let iterationPrompt;
+    let iterationPaths;
+    let beforeSnapshot;
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
+    try {
+      iterationPrompt = writeLeanWorkerPrompt(runPaths, iteration);
+      iterationPaths = iterationPrompt;
+      beforeSnapshot = captureIterationSnapshot(repoRoot);
+      commandResult = normalizeWorkerCommandResult(commandRunner(copilotCommand, [], repoRoot, {
+        env,
+        input: iterationPrompt.workerPrompt,
+      }));
+    } catch (error) {
+      commandResult = {
+        exitCode: 1,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const finishedAtMs = Date.now();
+    const finishedAt = new Date(finishedAtMs).toISOString();
+    const afterSnapshot = beforeSnapshot ? captureIterationSnapshot(repoRoot) : new Map();
+    const changes = beforeSnapshot ? compareIterationSnapshots(beforeSnapshot, afterSnapshot) : [];
+    const changedFiles = formatChangedFiles(changes);
+    const parsedFooter = parseWorkerFooter(`${commandResult.stdout}\n${commandResult.stderr}`);
+    const footer = parsedFooter.footer;
+    const footerError = parsedFooter.error;
+    const durationMs = Math.max(0, finishedAtMs - startedAtMs);
+    const iterationSummary = {
+      iteration,
+      command: copilotCommand,
+      args: [],
+      exitCode: commandResult.exitCode,
+      durationMs,
+      startedAt,
+      finishedAt,
+      stdout: commandResult.stdout,
+      stderr: commandResult.stderr,
+      changedFiles,
+      footer,
+      footerError,
+    };
+
+    if (iterationPaths) {
+      writeLeanIterationArtifacts(
+        iterationPaths,
+        iterationSummary,
+        buildIterationDiffPatch(changes),
+      );
+    }
+
+    iterations.push({
+      iteration,
+      command: copilotCommand,
+      exitCode: commandResult.exitCode,
+      stdout: commandResult.stdout,
+      stderr: commandResult.stderr,
+      durationMs,
+      changedFiles,
+      footer,
+      footerError,
+    });
+
+    if (footerError) {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        reason: footerError,
+      });
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: classifyLeanFooterStopReason(footerError) },
+      );
+    }
+
+    if (commandResult.exitCode !== 0) {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        reason: `Worker exited nonzero before supervisor verification: ${commandResult.exitCode}.`,
+      });
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'worker-exit-nonzero' },
+      );
+    }
+
+    if (footer.status === 'fail') {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        reason: 'Worker reported RALPH_STATUS: fail, so supervisor verification was not run.',
+      });
+      updateLeanSelectedProgressItem(
+        runPaths,
+        iterationPrompt && iterationPrompt.selectedItem,
+        'fail',
+        `fail: ${footer.summary}`,
+      );
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'worker-failed' },
+      );
+    }
+
+    if (footer.status === 'blocked') {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        reason: 'Worker reported RALPH_STATUS: blocked, so supervisor verification was not run.',
+      });
+      updateLeanSelectedProgressItem(
+        runPaths,
+        iterationPrompt && iterationPrompt.selectedItem,
+        'blocked',
+        `blocked: ${footer.summary}`,
+      );
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'blocked',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'blocked' },
+      );
+    }
+
+    const verifyResult = runLeanSupervisorVerify(verifyFn, {
+      repoRoot,
+      harnessPaths,
+      runId,
+      commandRunner,
+      env,
+    });
+    writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, verifyResult, { runId });
+
+    if (!verifyResult || verifyResult.status !== 'pass') {
+      updateLeanSelectedProgressItem(
+        runPaths,
+        iterationPrompt && iterationPrompt.selectedItem,
+        'fail',
+        `fail: ${footer.summary}; supervisor verify failed`,
+      );
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'validation-failed' },
+      );
+    }
+
+    updateLeanSelectedProgressItem(
+      runPaths,
+      iterationPrompt && iterationPrompt.selectedItem,
+      'pass',
+      `pass: ${footer.summary}; supervisor verify passed`,
+    );
+    if (!isLeanSelectedProgressItemCompleted(runPaths, iterationPrompt && iterationPrompt.selectedItem)) {
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'stalled',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'selected-item-not-completed' },
+      );
+    }
+  }
+
+  return finishLeanRun(
+    harnessPaths,
+    startedState,
+    'budget-exhausted',
+    maxIterations,
+    runId,
+    iterations,
+    { stopReason: 'budget-exhausted' },
+  );
+}
+
+function normalizeCommandExitCode(result) {
+  return Number.isInteger(result && result.status) ? result.status : 1;
+}
+
+function runCapturedValidationCommand(command, args, repoRoot, options = {}) {
+  const commandRunner = options.commandRunner || runCommand;
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+
+  try {
+    const result = commandRunner(command, args, repoRoot, { env: options.env || process.env });
+    const finishedAtMs = Date.now();
+    return {
+      commandDisplay: result && result.commandDisplay
+        ? result.commandDisplay
+        : formatCommandDisplay(command, args),
+      exitCode: normalizeCommandExitCode(result),
+      stdout: result && typeof result.stdout === 'string' ? result.stdout : '',
+      stderr: result && typeof result.stderr === 'string' ? result.stderr : '',
+      startedAt,
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: Math.max(0, finishedAtMs - startedAtMs),
+    };
+  } catch (error) {
+    const finishedAtMs = Date.now();
+    return {
+      commandDisplay: formatCommandDisplay(command, args),
+      exitCode: 1,
+      stdout: '',
+      stderr: error instanceof Error ? error.message : String(error),
+      startedAt,
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: Math.max(0, finishedAtMs - startedAtMs),
+    };
+  }
+}
+
+function buildLeanVerifyOutput(status, summary, commandResults) {
+  const results = Array.isArray(commandResults) ? commandResults : [commandResults];
+  const lines = [
+    `Verification ${status === 'pass' ? 'passed' : 'failed'}: ${summary}`,
+  ];
+
+  for (const commandResult of results) {
+    lines.push(
+      `Command: ${commandResult.commandDisplay}`,
+      `Exit code: ${commandResult.exitCode}`,
+      `Duration: ${commandResult.durationMs}ms`,
+    );
+
+    if (hasMeaningfulString(commandResult.stdout)) {
+      lines.push(`Stdout: ${commandResult.stdout.trim()}`);
+    }
+
+    if (hasMeaningfulString(commandResult.stderr)) {
+      lines.push(`Stderr: ${commandResult.stderr.trim()}`);
+    }
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function resolveVerifyRunId(harnessPaths, options = {}) {
+  if (hasMeaningfulString(options.runId)) {
+    return normalizeHarnessRunId(options.runId);
+  }
+
+  const state = readHarnessState(harnessPaths);
+  if (!state) {
+    return '';
+  }
+
+  const runId = hasMeaningfulString(state.activeRunId) ? state.activeRunId : state.latestRunId;
+  return hasMeaningfulString(runId) ? normalizeHarnessRunId(runId) : '';
+}
+
+function buildLeanValidationRecord(repoRoot, result) {
+  const generatedSpecs = Array.isArray(result.generatedSpecs) ? result.generatedSpecs : [];
+  return {
+    status: result.status,
+    runId: result.runId || '',
+    exitCode: Number.isInteger(result.exitCode) ? result.exitCode : result.status === 'pass' ? 0 : 1,
+    exportedStepCount: Number.isInteger(result.exportedStepCount) ? result.exportedStepCount : null,
+    listedTestCount: Number.isInteger(result.listedTestCount) ? result.listedTestCount : null,
+    generatedSpecs: generatedSpecs.map((generatedSpec) =>
+      normalizeDisplayPath(path.relative(repoRoot, generatedSpec))),
+    commands: Array.isArray(result.commands) ? result.commands : [],
+  };
+}
+
+function recordLeanValidationIfRunExists(repoRoot, result) {
+  if (!hasMeaningfulString(result && result.runId)) {
+    return result;
+  }
+
+  const runPaths = resolveHarnessPaths(repoRoot, { runId: result.runId });
+  fs.mkdirSync(runPaths.runDir, { recursive: true });
+  writeText(
+    runPaths.validationPath,
+    `${JSON.stringify(buildLeanValidationRecord(repoRoot, result), null, 2)}\n`,
+  );
+  return result;
+}
+
+function verify(options = {}) {
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
+  const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
+  const runId = resolveVerifyRunId(harnessPaths, options);
+  const finish = (result) => recordLeanValidationIfRunExists(repoRoot, result);
+  const exportCommand = runCapturedValidationCommand(getNpxCommand(), ['bddgen', 'export'], repoRoot, {
+    commandRunner: options.commandRunner,
+    env: options.env,
+  });
+  const commands = [exportCommand];
+  const exportedStepCount = parseExportedStepCount(`${exportCommand.stdout}\n${exportCommand.stderr}`);
+
+  if (exportCommand.exitCode !== 0) {
+    const summary = `bddgen export failed with exit code ${exportCommand.exitCode}.`;
+    return finish({
+      status: 'fail',
+      exitCode: 1,
+      harnessPaths,
+      commands,
+      exportedStepCount,
+      runId,
+      generatedSpecs: [],
+      output: buildLeanVerifyOutput('fail', summary, commands),
+    });
+  }
+
+  if (exportedStepCount < 1) {
+    const summary = 'bddgen export returned zero registered steps.';
+    return finish({
+      status: 'fail',
+      exitCode: 1,
+      harnessPaths,
+      commands,
+      exportedStepCount,
+      runId,
+      generatedSpecs: [],
+      output: buildLeanVerifyOutput('fail', summary, commands),
+    });
+  }
+
+  const testCommand = runCapturedValidationCommand(getNpxCommand(), ['bddgen', 'test'], repoRoot, {
+    commandRunner: options.commandRunner,
+    env: options.env,
+  });
+  commands.push(testCommand);
+
+  if (testCommand.exitCode !== 0) {
+    const summary = `bddgen test failed with exit code ${testCommand.exitCode}.`;
+    return finish({
+      status: 'fail',
+      exitCode: 1,
+      harnessPaths,
+      commands,
+      exportedStepCount,
+      runId,
+      generatedSpecs: [],
+      output: buildLeanVerifyOutput('fail', summary, commands),
+    });
+  }
+
+  const generatedSpecs = runId ? findGeneratedSpecsForRun(repoRoot, runId) : [];
+  if (runId && generatedSpecs.length === 0) {
+    const summary = `No generated Playwright specs were found for run ${runId}.`;
+    return finish({
+      status: 'fail',
+      exitCode: 1,
+      harnessPaths,
+      commands,
+      exportedStepCount,
+      runId,
+      generatedSpecs,
+      output: buildLeanVerifyOutput('fail', summary, commands),
+    });
+  }
+
+  let listedTestCount;
+  if (runId && generatedSpecs.length > 0) {
+    const generatedSpecArgs = generatedSpecs.map((generatedSpec) =>
+      normalizeDisplayPath(path.relative(repoRoot, generatedSpec)));
+    const listCommand = runCapturedValidationCommand(
+      getNpxCommand(),
+      ['playwright', 'test', '--list', ...generatedSpecArgs],
+      repoRoot,
+      {
+        commandRunner: options.commandRunner,
+        env: options.env,
+      },
+    );
+    commands.push(listCommand);
+
+    if (listCommand.exitCode !== 0) {
+      const summary = `playwright test --list failed with exit code ${listCommand.exitCode}.`;
+      return finish({
+        status: 'fail',
+        exitCode: 1,
+        harnessPaths,
+        commands,
+        exportedStepCount,
+        runId,
+        generatedSpecs,
+        output: buildLeanVerifyOutput('fail', summary, commands),
+      });
+    }
+
+    listedTestCount = parseListedTestCount(`${listCommand.stdout}\n${listCommand.stderr}`);
+    if (listedTestCount < 1) {
+      const summary = `playwright test --list did not find generated tests for run ${runId}.`;
+      return finish({
+        status: 'fail',
+        exitCode: 1,
+        harnessPaths,
+        commands,
+        exportedStepCount,
+        listedTestCount,
+        runId,
+        generatedSpecs,
+        output: buildLeanVerifyOutput('fail', summary, commands),
+      });
+    }
+  }
+
+  const stepLabel = `${exportedStepCount} step${exportedStepCount === 1 ? '' : 's'}`;
+  const specLabel = runId
+    ? `${generatedSpecs.length} spec${generatedSpecs.length === 1 ? '' : 's'}`
+    : 'spec discovery skipped because no run id exists';
+  const listLabel = listedTestCount == null
+    ? 'playwright test --list skipped because no run-backed specs exist'
+    : `playwright test --list found ${listedTestCount} test${listedTestCount === 1 ? '' : 's'}`;
+  const summary = `bddgen export registered ${stepLabel}; bddgen test generated ${specLabel}; ${listLabel}.`;
+  return finish({
+    status: 'pass',
+    harnessPaths,
+    commands,
+    exportedStepCount,
+    listedTestCount,
+    runId,
+    generatedSpecs,
+    output: buildLeanVerifyOutput('pass', summary, commands),
+  });
 }
 
 function recordClarifierSummaryInArtifacts(runPaths, summary) {
@@ -1144,10 +2533,6 @@ function buildHarnessCommandDescription(commandName, options = {}) {
 
   if (hasMeaningfulString(options.runId)) {
     commandParts.push('--run-id', options.runId);
-  }
-
-  if (hasMeaningfulString(options.adapter)) {
-    commandParts.push('--adapter', options.adapter);
   }
 
   if (options.maxIterations != null) {
@@ -2589,7 +3974,8 @@ function prepareRun(options) {
 }
 
 function extractTemplatePlaceholders(templateContent) {
-  return templateContent.match(/<[^>\r\n]+>/g) || [];
+  return (templateContent.match(/<[^>\r\n]+>/g) || [])
+    .filter((placeholder) => !RALPH_FOOTER_DESCRIPTOR_PLACEHOLDERS.has(placeholder));
 }
 
 function getTemplatePlaceholders(templatesDir) {
@@ -2710,14 +4096,39 @@ function quoteWindowsShellArg(value) {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+function isWindowsCommandShim(command) {
+  return process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command);
+}
+
+function quoteWindowsShellArg(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) {
+    return text;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
 function runProcess(command, args, cwd, options = {}) {
   const invocation = resolveProjectCliInvocation(command, args, cwd);
-  const result = spawnSync(invocation.command, invocation.args, {
+  const spawnOptions = {
     cwd,
     env: options.env || process.env,
     encoding: 'utf8',
     stdio: 'pipe',
-  });
+  };
+  if (Object.prototype.hasOwnProperty.call(options, 'input')) {
+    spawnOptions.input = options.input;
+  }
+  const result = isWindowsCommandShim(invocation.command)
+    ? spawnSync(
+      [invocation.command, ...invocation.args].map(quoteWindowsShellArg).join(' '),
+      {
+        ...spawnOptions,
+        shell: true,
+      },
+    )
+    : spawnSync(invocation.command, invocation.args, spawnOptions);
 
   if (result.error) {
     throw result.error;
@@ -2774,10 +4185,9 @@ function walkFiles(rootDir) {
 }
 
 function findGeneratedSpecsForRun(repoRoot, runId) {
-  const generatedRoot = path.join(repoRoot, '.features-gen');
-  return walkFiles(generatedRoot).filter(
-    (filePath) =>
-      filePath.includes(runId) && /\.spec\.(c|m)?[jt]s$/i.test(filePath),
+  const { generatedRunDir } = resolveGeneratedHarnessPaths(repoRoot, { runId });
+  return walkFiles(generatedRunDir).filter(
+    (filePath) => /\.spec\.(c|m)?[jt]s$/i.test(filePath),
   ).sort();
 }
 
@@ -2894,6 +4304,28 @@ function sanitizeInlineCode(value) {
 
 function sanitizeOptionalInlineCode(value) {
   return value == null ? '' : sanitizeInlineCode(value);
+}
+
+function normalizeStringList(value) {
+  const values = Array.isArray(value)
+    ? value
+    : value == null
+      ? []
+      : [value];
+  const normalizedValues = [];
+  const seenValues = new Set();
+
+  for (const entry of values) {
+    const normalizedEntry = sanitizeOptionalInlineCode(entry);
+    if (!normalizedEntry || seenValues.has(normalizedEntry)) {
+      continue;
+    }
+
+    seenValues.add(normalizedEntry);
+    normalizedValues.push(normalizedEntry);
+  }
+
+  return normalizedValues;
 }
 
 function formatCommandArg(arg) {
@@ -3381,2784 +4813,6 @@ function upsertProgressItemResult(progressPath, options) {
   writeText(progressPath, appendProgressItem(content, options.sectionTitle, appendedBlock));
 }
 
-function assertRuntimeAdapterName(adapterName) {
-  if (!RUNTIME_ADAPTER_NAMES.has(adapterName)) {
-    throw new Error(
-      `Unsupported runtime adapter "${adapterName}". Expected one of: ${Array.from(RUNTIME_ADAPTER_NAMES).join(', ')}.`,
-    );
-  }
-}
-
-function buildRuntimeAdapterArtifactArgs(runId, runPaths, selectedItem) {
-  return [
-    '--run-id',
-    runId,
-    '--run-dir',
-    runPaths.runDir,
-    '--prompt-path',
-    runPaths.promptPath,
-    '--prd-path',
-    runPaths.prdPath,
-    '--progress-path',
-    runPaths.progressPath,
-    '--normalized-feature-path',
-    runPaths.normalizedFeaturePath,
-    '--item-id',
-    selectedItem.id,
-    '--item-goal',
-    selectedItem.goal,
-    '--item-verify',
-    selectedItem.verify,
-  ];
-}
-
-function parseEnvStringArray(rawValue, envVarName) {
-  if (!rawValue) {
-    return [];
-  }
-
-  let parsedValue;
-  try {
-    parsedValue = JSON.parse(rawValue);
-  } catch (error) {
-    throw new Error(`${envVarName} must be a JSON array of strings.`);
-  }
-
-  if (!Array.isArray(parsedValue) || parsedValue.some((value) => typeof value !== 'string')) {
-    throw new Error(`${envVarName} must be a JSON array of strings.`);
-  }
-
-  return parsedValue;
-}
-
-function buildRuntimeAdapterInvocation(options) {
-  const adapterName = options.adapterName || 'external';
-  const repoRoot = options.repoRoot || process.cwd();
-  const env = options.env || process.env;
-  const baseArgs = buildRuntimeAdapterArtifactArgs(options.runId, options.runPaths, options.selectedItem);
-  const configuredArgs = parseEnvStringArray(env.QA_HARNESS_EXTERNAL_RUNTIME_ARGS, 'QA_HARNESS_EXTERNAL_RUNTIME_ARGS');
-  const invocationEnv = applyExecutionControlsToEnv(env, options.executionControls, {
-    QA_HARNESS_ACTIVE_BROWSER_RUNTIME: 'playwright-cli',
-  });
-
-  assertRuntimeAdapterName(adapterName);
-
-  if (adapterName === 'mock') {
-    return {
-      adapterName,
-      command: process.execPath,
-      args: [path.join(__dirname, 'qa-runtime-mock-adapter.js'), ...baseArgs],
-      cwd: repoRoot,
-      env: invocationEnv,
-    };
-  }
-
-  const command = env.QA_HARNESS_EXTERNAL_RUNTIME_CMD;
-  if (typeof command === 'string' && command.trim()) {
-    return {
-      adapterName,
-      command: command.trim(),
-      args: [...configuredArgs, ...baseArgs],
-      cwd: repoRoot,
-      env: invocationEnv,
-    };
-  }
-
-  return {
-    adapterName,
-    command: process.execPath,
-    args: [path.join(__dirname, 'qa-runtime-external-worker.js'), ...configuredArgs, ...baseArgs],
-    cwd: repoRoot,
-    env: invocationEnv,
-  };
-}
-
-function buildPlaywrightBridgeInvocation(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const env = options.env || process.env;
-  const command = env.QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD;
-  if (typeof command !== 'string' || !command.trim()) {
-    throw new Error('Playwright test/debug bridge requested but QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD is not configured.');
-  }
-
-  const baseArgs = buildRuntimeAdapterArtifactArgs(options.runId, options.runPaths, options.selectedItem);
-  return {
-    adapterName: options.adapterName || 'external',
-    command: command.trim(),
-    args: [...parseEnvStringArray(env.QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS, 'QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS'), ...baseArgs],
-    cwd: repoRoot,
-    env: applyExecutionControlsToEnv(env, options.executionControls, {
-      QA_HARNESS_ACTIVE_BROWSER_RUNTIME: 'playwright-test',
-      QA_HARNESS_PREVIOUS_BROWSER_RUNTIME: 'playwright-cli',
-      QA_HARNESS_BRIDGE_REASON: options.bridgeReason || '',
-    }),
-  };
-}
-
-function appendPlaywrightExecutionControlArgs(args, executionControlState, options = {}) {
-  const nextArgs = Array.isArray(args) ? [...args] : [];
-  if (!executionControlState || !executionControlState.shouldPersist) {
-    return nextArgs;
-  }
-
-  const controls = executionControlState.controls;
-  const includeProject = options.includeProject !== false;
-  if (includeProject) {
-    nextArgs.push(`--project=${sanitizeInlineCode(controls.project || DEFAULT_EXECUTION_CONTROLS.project)}`);
-  }
-
-  if (controls.headed) {
-    nextArgs.push('--headed');
-  }
-
-  if (controls.debug) {
-    nextArgs.push('--debug');
-  }
-
-  if (controls.trace) {
-    nextArgs.push(`--trace=${sanitizeInlineCode(controls.trace)}`);
-  }
-
-  if (controls.video) {
-    nextArgs.push(`--video=${sanitizeInlineCode(controls.video)}`);
-  }
-
-  if (controls.screenshot) {
-    nextArgs.push(`--screenshot=${sanitizeInlineCode(controls.screenshot)}`);
-  }
-
-  return nextArgs;
-}
-
-function normalizeStringList(value) {
-  const values = Array.isArray(value)
-    ? value
-    : value == null
-      ? []
-      : [value];
-  const normalizedValues = [];
-  const seenValues = new Set();
-
-  for (const entry of values) {
-    const normalizedEntry = sanitizeOptionalInlineCode(entry);
-    if (!normalizedEntry || seenValues.has(normalizedEntry)) {
-      continue;
-    }
-
-    seenValues.add(normalizedEntry);
-    normalizedValues.push(normalizedEntry);
-  }
-
-  return normalizedValues;
-}
-
-function readObjectStringField(record, keys) {
-  if (!record || typeof record !== 'object' || Array.isArray(record)) {
-    return '';
-  }
-
-  for (const key of keys) {
-    if (hasMeaningfulString(record[key])) {
-      return sanitizeInlineCode(record[key]);
-    }
-  }
-
-  return '';
-}
-
-function readGapCandidateField(candidate, keys) {
-  return readObjectStringField(candidate, keys);
-}
-
-function normalizeGapCandidates(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  const normalizedCandidates = [];
-  const seenCandidates = new Set();
-
-  for (const candidate of value) {
-    let gap = '';
-    let candidateScenario = '';
-    let additionTarget = '';
-    let evidence = [];
-
-    if (typeof candidate === 'string') {
-      gap = sanitizeInlineCode(candidate);
-    } else if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
-      gap = readGapCandidateField(candidate, ['gap', 'observedGap', 'summary', 'title']);
-      candidateScenario = readGapCandidateField(candidate, ['candidateScenario', 'scenario', 'proposal']);
-      additionTarget = readGapCandidateField(candidate, [
-        'additionTarget',
-        'scenarioAdditionTarget',
-        'scenarioTarget',
-        'target',
-      ]);
-      evidence = normalizeStringList(
-        [
-          ...normalizeStringList(candidate.evidence),
-          ...normalizeStringList(candidate.supportingEvidence),
-          ...normalizeStringList(candidate.evidenceRefs),
-          ...normalizeStringList(candidate.evidenceReferences),
-        ],
-      );
-    }
-
-    if (!gap && !candidateScenario && !additionTarget && evidence.length === 0) {
-      continue;
-    }
-
-    const key = JSON.stringify([gap, candidateScenario, additionTarget, evidence]);
-    if (seenCandidates.has(key)) {
-      continue;
-    }
-
-    seenCandidates.add(key);
-    normalizedCandidates.push({
-      gap,
-      candidateScenario,
-      additionTarget,
-      evidence,
-    });
-  }
-
-  return normalizedCandidates;
-}
-
-function normalizeCoverageScope(value) {
-  return typeof value === 'string' && value.trim() ? sanitizeInlineCode(value) : '';
-}
-
-function flattenGapCandidateEvidence(gapCandidates) {
-  if (!Array.isArray(gapCandidates)) {
-    return [];
-  }
-
-  return normalizeStringList(
-    gapCandidates.flatMap((candidate) => (
-      candidate && typeof candidate === 'object' && Array.isArray(candidate.evidence)
-        ? candidate.evidence
-        : []
-    )),
-  );
-}
-
-function resolveExplorerIterationSignals(runtimeResult) {
-  const gapCandidates = Array.isArray(runtimeResult.gapCandidates) ? runtimeResult.gapCandidates : [];
-  const singleCandidate = gapCandidates.length === 1 ? gapCandidates[0] : null;
-
-  return {
-    observedGap: sanitizeOptionalInlineCode(runtimeResult.observedGap || (singleCandidate && singleCandidate.gap)),
-    candidateScenario: sanitizeOptionalInlineCode(
-      runtimeResult.candidateScenario || (singleCandidate && singleCandidate.candidateScenario),
-    ),
-    additionTarget: sanitizeOptionalInlineCode(
-      runtimeResult.additionTarget || (singleCandidate && singleCandidate.additionTarget),
-    ),
-    supportingEvidence: normalizeStringList([
-      ...normalizeStringList(runtimeResult.evidence),
-      ...flattenGapCandidateEvidence(gapCandidates),
-    ]),
-    escalationReason: sanitizeOptionalInlineCode(runtimeResult.escalationReason),
-    stopReason: sanitizeOptionalInlineCode(runtimeResult.stopReason),
-  };
-}
-
-function resolveExplorerScope(selectedItem, prdContent, runtimeResult) {
-  const runtimeScope = normalizeCoverageScope(runtimeResult.coverageScope);
-  if (runtimeScope) {
-    return runtimeScope;
-  }
-
-  const guidedScenarioScope = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Guided scenario scope'));
-  if (guidedScenarioScope && !/^not provided$/i.test(guidedScenarioScope)) {
-    return sanitizeInlineCode(guidedScenarioScope);
-  }
-
-  const guidedFeatureScope = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Guided feature scope'));
-  if (guidedFeatureScope && !/^not provided$/i.test(guidedFeatureScope)) {
-    return sanitizeInlineCode(guidedFeatureScope);
-  }
-
-  const guidedRiskAreas = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Guided risk areas'));
-  if (guidedRiskAreas && !/^not provided$/i.test(guidedRiskAreas)) {
-    return sanitizeInlineCode(guidedRiskAreas);
-  }
-
-  const autonomousTarget = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Autonomous target'));
-  if (autonomousTarget && !/^not provided$/i.test(autonomousTarget)) {
-    return sanitizeInlineCode(autonomousTarget);
-  }
-
-  const primaryScenarioScope = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Primary scenario scope'));
-  if (primaryScenarioScope) {
-    return sanitizeInlineCode(primaryScenarioScope);
-  }
-
-  const sourceReference = stripMarkdownInlineCode(readMarkdownSummaryField(prdContent, 'Source reference'));
-  if (sourceReference) {
-    return sanitizeInlineCode(sourceReference);
-  }
-
-  return sanitizeInlineCode(selectedItem.goal || selectedItem.id);
-}
-
-function buildGuidedExplorationArtifactLines(guidedExploration, options = {}) {
-  if (!guidedExploration || !guidedExploration.active) {
-    return [];
-  }
-
-  const lines = [
-    'Guided exploration: yes',
-    `Guided scope kind: ${sanitizeInlineCode(guidedExploration.scopeKind || 'single-feature')}`,
-    `Guided feature scope: ${sanitizeInlineCode(formatGuidedExplorationList(guidedExploration.featureScopes))}`,
-    `Guided scenario scope: ${sanitizeInlineCode(formatGuidedExplorationList(guidedExploration.scenarioScopes))}`,
-    `Guided risk areas: ${sanitizeInlineCode(formatGuidedExplorationList(guidedExploration.riskAreas))}`,
-    `Guided iteration budget: ${sanitizeInlineCode(formatGuidedExplorationCount(guidedExploration.iterationBudget))}`,
-  ];
-
-  if (Object.prototype.hasOwnProperty.call(options, 'recordedIterationsBefore')) {
-    lines.push(
-      `Guided iterations recorded before run: ${sanitizeInlineCode(formatGuidedExplorationCount(options.recordedIterationsBefore))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'recordedIterationsAfter')) {
-    lines.push(
-      `Guided iterations recorded after run: ${sanitizeInlineCode(formatGuidedExplorationCount(options.recordedIterationsAfter))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'remainingIterationsBefore')) {
-    lines.push(
-      `Guided iterations remaining before run: ${sanitizeInlineCode(formatGuidedExplorationCount(options.remainingIterationsBefore))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'remainingIterationsAfter')) {
-    lines.push(
-      `Guided iterations remaining after run: ${sanitizeInlineCode(formatGuidedExplorationCount(options.remainingIterationsAfter))}`,
-    );
-  }
-
-  lines.push(`Guided findings artifact: ${GAP_ANALYSIS_ARTIFACT_DISPLAY}`);
-  lines.push(`Guided stop conditions: ${sanitizeInlineCode(guidedExploration.stopConditionsText)}`);
-
-  return lines;
-}
-
-function buildAutonomousExplorationArtifactLines(autonomousExploration, options = {}) {
-  if (!autonomousExploration || !autonomousExploration.active) {
-    return [];
-  }
-
-  const lines = [
-    'Autonomous exploration: yes',
-    `Autonomous target kind: ${sanitizeInlineCode(autonomousExploration.targetKind || 'feature')}`,
-    `Autonomous target: ${sanitizeInlineCode(autonomousExploration.target || 'not selected')}`,
-    `Autonomous target source: ${sanitizeInlineCode(autonomousExploration.targetSource || 'normalized.feature')}`,
-    `Autonomous iteration budget: ${sanitizeInlineCode(formatAutonomousExplorationCount(autonomousExploration.iterationBudget))}`,
-  ];
-
-  if (Object.prototype.hasOwnProperty.call(options, 'recordedIterationsBefore')) {
-    lines.push(
-      `Autonomous iterations recorded before run: ${sanitizeInlineCode(formatAutonomousExplorationCount(options.recordedIterationsBefore))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'recordedIterationsAfter')) {
-    lines.push(
-      `Autonomous iterations recorded after run: ${sanitizeInlineCode(formatAutonomousExplorationCount(options.recordedIterationsAfter))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'remainingIterationsBefore')) {
-    lines.push(
-      `Autonomous iterations remaining before run: ${sanitizeInlineCode(formatAutonomousExplorationCount(options.remainingIterationsBefore))}`,
-    );
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'remainingIterationsAfter')) {
-    lines.push(
-      `Autonomous iterations remaining after run: ${sanitizeInlineCode(formatAutonomousExplorationCount(options.remainingIterationsAfter))}`,
-    );
-  }
-
-  lines.push(`Autonomous findings artifact: ${GAP_ANALYSIS_ARTIFACT_DISPLAY}`);
-  lines.push(`Autonomous stop frame: ${sanitizeInlineCode(autonomousExploration.stopFrameText)}`);
-
-  return lines;
-}
-
-function formatExplorerGapAnalysisSummary(recordedOutcome, fallbackSummary) {
-  const candidateCount = parseOptionalNonNegativeInteger(recordedOutcome.gapAnalysisCandidateCount);
-  const scope = sanitizeOptionalInlineCode(recordedOutcome.gapAnalysisScope);
-  const baseSummary = sanitizeInlineCode(recordedOutcome.gapAnalysisSummary || fallbackSummary || 'gap analysis summary unavailable.');
-  const gapLabel = candidateCount == null
-    ? 'gap analysis'
-    : `${candidateCount} gap candidate${candidateCount === 1 ? '' : 's'}`;
-  const scopeLabel = scope ? `${gapLabel} for ${scope}` : gapLabel;
-  return `${scopeLabel}: ${baseSummary}`;
-}
-
-function formatHealingReportSummary(recordedOutcome, fallbackSummary) {
-  const baseSummary = sanitizeInlineCode(recordedOutcome.healSummary || fallbackSummary || 'heal report summary unavailable.');
-  const segments = [baseSummary];
-
-  if (recordedOutcome.healSmallestFailingUnit) {
-    segments.push(`smallest failing unit: ${sanitizeInlineCode(recordedOutcome.healSmallestFailingUnit)}`);
-  }
-
-  if (recordedOutcome.healRootCauseHypothesis) {
-    segments.push(`hypothesis: ${sanitizeInlineCode(recordedOutcome.healRootCauseHypothesis)}`);
-  }
-
-  if (recordedOutcome.healEscalationReason) {
-    segments.push(`escalation: ${sanitizeInlineCode(recordedOutcome.healEscalationReason)}`);
-  }
-
-  return segments.join('; ');
-}
-
-function resolveScenarioAdditionTargetArtifact(runPaths, rawValue) {
-  if (hasMeaningfulString(rawValue)) {
-    const value = rawValue.trim();
-    if (path.isAbsolute(value)) {
-      return resolveDisplayPath(runPaths.runDir, value);
-    }
-
-    return normalizeDisplayPath(value);
-  }
-
-  return normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.normalizedFeaturePath));
-}
-
-function resolveScenarioAdditionSignals(runtimeResult, runPaths) {
-  const blockReason = sanitizeOptionalInlineCode(
-    runtimeResult.blockReason || (runtimeResult.status === 'blocked' ? runtimeResult.stopReason : ''),
-  );
-
-  return {
-    addedScenarioOrOutline: sanitizeOptionalInlineCode(runtimeResult.addedScenarioOrOutline),
-    targetArtifact: resolveScenarioAdditionTargetArtifact(runPaths, runtimeResult.targetArtifactPath),
-    supportingEvidence: normalizeStringList(runtimeResult.evidence),
-    escalationReason: sanitizeOptionalInlineCode(runtimeResult.escalationReason),
-    stopReason: sanitizeOptionalInlineCode(runtimeResult.stopReason),
-    blockReason,
-  };
-}
-
-function formatScenarioAdditionSummary(recordedOutcome, fallbackSummary) {
-  const baseSummary = sanitizeInlineCode(
-    recordedOutcome.scenarioAdditionSummary || fallbackSummary || 'scenario addition summary unavailable.',
-  );
-  const targetArtifact = sanitizeInlineCode(recordedOutcome.scenarioAdditionTargetArtifact || 'normalized.feature');
-  const addedScenarioOrOutline = sanitizeOptionalInlineCode(recordedOutcome.scenarioAdditionAddedScenarioOrOutline);
-
-  if (addedScenarioOrOutline) {
-    return `added ${addedScenarioOrOutline} in ${targetArtifact}: ${baseSummary}`;
-  }
-
-  return `scenario addition in ${targetArtifact}: ${baseSummary}`;
-}
-
-function normalizeFeatureTextForComparison(content) {
-  return String(content || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]+$/gm, '')
-    .trimEnd();
-}
-
-function trimTrailingBlankLines(lines) {
-  const trimmedLines = [...lines];
-  while (trimmedLines.length > 0 && !trimmedLines[trimmedLines.length - 1].trim()) {
-    trimmedLines.pop();
-  }
-
-  return trimmedLines;
-}
-
-function finalizeFeatureScenarioBlock(blockLines, scenarioBlocks) {
-  const normalizedLines = trimTrailingBlankLines(blockLines);
-  if (normalizedLines.length === 0) {
-    return;
-  }
-
-  const headingLine = normalizedLines.find((line) => /^\s*Scenario(?: Outline)?:\s+/.test(line)) || '';
-  scenarioBlocks.push({
-    headingLine: sanitizeInlineCode(headingLine.trim()),
-    blockText: normalizeFeatureTextForComparison(normalizedLines.join('\n')),
-  });
-}
-
-function parseFeatureScenarioBlocks(featureContent) {
-  const normalizedContent = normalizeFeatureTextForComparison(featureContent);
-  const lines = normalizedContent ? normalizedContent.split('\n') : [];
-  const scenarioBlocks = [];
-  const preambleLines = [];
-  let currentScenarioLines = null;
-  let pendingScenarioTags = [];
-
-  for (const line of lines) {
-    if (/^\s*@/.test(line)) {
-      if (currentScenarioLines) {
-        finalizeFeatureScenarioBlock(currentScenarioLines, scenarioBlocks);
-        currentScenarioLines = null;
-      }
-
-      pendingScenarioTags.push(line);
-      continue;
-    }
-
-    if (/^\s*Scenario(?: Outline)?:\s+/.test(line)) {
-      if (currentScenarioLines) {
-        finalizeFeatureScenarioBlock(currentScenarioLines, scenarioBlocks);
-      }
-
-      currentScenarioLines = [...pendingScenarioTags, line];
-      pendingScenarioTags = [];
-      continue;
-    }
-
-    if (currentScenarioLines) {
-      currentScenarioLines.push(line);
-      continue;
-    }
-
-    if (pendingScenarioTags.length > 0) {
-      preambleLines.push(...pendingScenarioTags);
-      pendingScenarioTags = [];
-    }
-
-    preambleLines.push(line);
-  }
-
-  if (currentScenarioLines) {
-    finalizeFeatureScenarioBlock(currentScenarioLines, scenarioBlocks);
-  } else if (pendingScenarioTags.length > 0) {
-    preambleLines.push(...pendingScenarioTags);
-  }
-
-  return {
-    preambleText: normalizeFeatureTextForComparison(preambleLines.join('\n')),
-    scenarioBlocks,
-  };
-}
-
-function areScenarioBlockListsEquivalent(leftBlocks, rightBlocks) {
-  return (
-    Array.isArray(leftBlocks)
-    && Array.isArray(rightBlocks)
-    && leftBlocks.length === rightBlocks.length
-    && leftBlocks.every((block, index) => block.blockText === rightBlocks[index].blockText)
-  );
-}
-
-function normalizeScenarioHeading(value) {
-  const normalizedValue = sanitizeOptionalInlineCode(value);
-  if (!normalizedValue) {
-    return '';
-  }
-
-  if (/^Scenario(?: Outline)?:\s+/i.test(normalizedValue)) {
-    const headingMatch = normalizedValue.match(/^(Scenario(?: Outline)?):\s+(.+)$/i);
-    if (!headingMatch) {
-      return normalizedValue;
-    }
-
-    const headingPrefix = /^scenario outline$/i.test(headingMatch[1]) ? 'Scenario Outline' : 'Scenario';
-    return `${headingPrefix}: ${headingMatch[2].trim()}`;
-  }
-
-  return `Scenario: ${normalizedValue}`;
-}
-
-function resolvePromotionScenarioHeading(recordedOutcome, plannerHandoffRecord) {
-  const candidates = [
-    normalizeScenarioHeading(recordedOutcome && recordedOutcome.scenarioAdditionAddedScenarioOrOutline),
-    normalizeScenarioHeading(plannerHandoffRecord && plannerHandoffRecord.candidateScenario),
-  ];
-
-  return candidates.find(Boolean) || '';
-}
-
-function stripGherkinKeyword(stepLine) {
-  const match = String(stepLine || '').trim().match(/^(?:Given|When|Then|And|But)\s+(.+)$/);
-  return match ? match[1].trim() : '';
-}
-
-function extractFeatureStepTexts(featureContent) {
-  const stepTexts = [];
-
-  for (const line of normalizeFeatureTextForComparison(featureContent).split('\n')) {
-    const stepText = stripGherkinKeyword(line);
-    if (stepText) {
-      stepTexts.push(stepText);
-    }
-  }
-
-  return normalizeStringList(stepTexts);
-}
-
-function extractFeaturePathReference(value) {
-  if (!hasMeaningfulString(value)) {
-    return '';
-  }
-
-  const matches = Array.from(
-    value.matchAll(/(?:[A-Za-z]:)?(?:[^:\s"'`()]+[\\/])*[^:\s"'`()]+\.feature/giu),
-  );
-
-  for (const match of matches) {
-    const candidate = sanitizeOptionalInlineCode(match[0]);
-    if (candidate && /(^|[\\/])Features([\\/]|$)/i.test(candidate)) {
-      return candidate;
-    }
-  }
-
-  return '';
-}
-
-function isPathWithin(parentDir, targetPath) {
-  const relativePath = path.relative(parentDir, targetPath);
-  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
-}
-
-function resolveCanonicalPromotionTarget(repoRoot, artifactSet, plannerHandoffRecord) {
-  const featuresRoot = path.join(repoRoot, 'Features');
-  const candidates = new Map();
-
-  const registerCandidate = (rawValue, sourceLabel) => {
-    const featurePath = extractFeaturePathReference(rawValue);
-    if (!featurePath) {
-      return;
-    }
-
-    const resolvedPath = path.resolve(repoRoot, featurePath);
-    if (path.extname(resolvedPath).toLowerCase() !== '.feature' || !isPathWithin(featuresRoot, resolvedPath)) {
-      return;
-    }
-
-    const key = normalizeDisplayPath(resolvedPath);
-    const existing = candidates.get(key) || {
-      resolvedPath,
-      sourceLabels: [],
-    };
-    existing.sourceLabels.push(sourceLabel);
-    candidates.set(key, existing);
-  };
-
-  registerCandidate(resolvePlannerSourceRefDisplay(artifactSet), 'source reference');
-  registerCandidate(plannerHandoffRecord && plannerHandoffRecord.candidateAdditionTarget, 'planner addition target');
-
-  const resolvedCandidates = Array.from(candidates.values());
-  if (resolvedCandidates.length === 0) {
-    return {
-      status: 'blocked',
-      summary: 'canonical target could not be resolved from current run artifacts.',
-      targetPath: '',
-      targetDisplayPath: '',
-      candidateSources: [],
-    };
-  }
-
-  if (resolvedCandidates.length > 1) {
-    return {
-      status: 'blocked',
-      summary: `canonical target is ambiguous across ${resolvedCandidates.map((candidate) => resolveDisplayPath(repoRoot, candidate.resolvedPath)).join(', ')}.`,
-      targetPath: '',
-      targetDisplayPath: '',
-      candidateSources: resolvedCandidates.flatMap((candidate) => candidate.sourceLabels),
-    };
-  }
-
-  const targetPath = resolvedCandidates[0].resolvedPath;
-  const sourceLabels = resolvedCandidates[0].sourceLabels;
-  const targetDisplayPath = resolveDisplayPath(repoRoot, targetPath);
-  if (!pathExists(targetPath)) {
-    return {
-      status: 'blocked',
-      summary: `canonical target ${targetDisplayPath} is missing.`,
-      targetPath,
-      targetDisplayPath,
-      candidateSources: sourceLabels,
-    };
-  }
-
-  return {
-    status: 'pass',
-    summary: '',
-    targetPath,
-    targetDisplayPath,
-    candidateSources: sourceLabels,
-  };
-}
-
-function hasConflictMarkers(content) {
-  return /^(?:<{7}|={7}|>{7})/m.test(String(content || ''));
-}
-
-function unescapeStepExpressionLiteral(rawValue, quote) {
-  return String(rawValue || '')
-    .replace(new RegExp(`\\\\${escapeForRegExp(quote)}`, 'g'), quote)
-    .replace(/\\\\/g, '\\')
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t');
-}
-
-function extractRegisteredStepExpressions(stepFileContent) {
-  const expressions = [];
-  const pattern = /\b(?:Given|When|Then)\(\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1\s*,/g;
-  let match;
-
-  while ((match = pattern.exec(stepFileContent)) !== null) {
-    expressions.push(unescapeStepExpressionLiteral(match[2], match[1]));
-  }
-
-  return normalizeStringList(expressions);
-}
-
-function cucumberExpressionToRegExp(expression) {
-  let pattern = escapeForRegExp(expression);
-  pattern = pattern.replace(/\\\{string\\\}/g, '(?:"(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')');
-  pattern = pattern.replace(/\\\{int\\\}/g, '-?\\d+');
-  pattern = pattern.replace(/\\\{float\\\}/g, '-?(?:\\d+|\\d*\\.\\d+)');
-  pattern = pattern.replace(/\\\{word\\\}/g, '[^\\s]+');
-  pattern = pattern.replace(/\\\{[^}]+\\\}/g, '.+');
-  return new RegExp(`^${pattern}$`);
-}
-
-function stepTextMatchesExpression(stepText, expression) {
-  try {
-    return cucumberExpressionToRegExp(expression).test(stepText);
-  } catch (error) {
-    return false;
-  }
-}
-
-function collectStepDefinitions(repoRoot, overrideFiles = new Map()) {
-  const stepsDir = path.join(repoRoot, 'Features', 'steps');
-  const definitions = [];
-  const stepFiles = new Set();
-
-  if (pathExists(stepsDir)) {
-    walkFiles(stepsDir)
-      .filter((filePath) => /\.(c|m)?tsx?$/i.test(filePath))
-      .forEach((filePath) => stepFiles.add(filePath));
-  }
-
-  for (const filePath of overrideFiles.keys()) {
-    if (/\.(c|m)?tsx?$/i.test(filePath)) {
-      stepFiles.add(filePath);
-    }
-  }
-
-  for (const filePath of Array.from(stepFiles).sort()) {
-    const fileContent = overrideFiles.has(filePath)
-      ? overrideFiles.get(filePath)
-      : readText(filePath);
-    const fileDisplayPath = resolveDisplayPath(repoRoot, filePath);
-    extractRegisteredStepExpressions(fileContent).forEach((expression) => {
-      definitions.push({
-        expression,
-        fileDisplayPath,
-      });
-    });
-  }
-
-  return definitions;
-}
-
-function findMissingFeatureSteps(stepTexts, definitions) {
-  return normalizeStringList(
-    stepTexts.filter((stepText) => !definitions.some((definition) => stepTextMatchesExpression(stepText, definition.expression))),
-  );
-}
-
-function resolvePromotionGeneratedStepRecord(stepText) {
-  return PROMOTION_GENERATED_STEP_LIBRARY.find((record) => stepTextMatchesExpression(stepText, record.expression)) || null;
-}
-
-function buildPromotionGeneratedStepFileContent(records) {
-  if (!Array.isArray(records) || records.length === 0) {
-    return '';
-  }
-
-  const orderedRecords = PROMOTION_GENERATED_STEP_LIBRARY.filter((candidate) =>
-    records.some((record) => record.expression === candidate.expression),
-  );
-  const keywordImports = Array.from(new Set(orderedRecords.flatMap((record) => record.keywords))).sort();
-  const helperImports = Array.from(new Set(orderedRecords.flatMap((record) => record.helperImports))).sort();
-  const importLines = [];
-
-  if (orderedRecords.some((record) => record.importExpect)) {
-    importLines.push("import { expect } from '@playwright/test';");
-  }
-
-  importLines.push(`import { ${keywordImports.join(', ')} } from './fixtures';`);
-
-  if (helperImports.length > 0) {
-    importLines.push(`import { ${helperImports.join(', ')} } from './index';`);
-  }
-
-  return [
-    ...importLines,
-    '',
-    PROMOTION_STEP_FILE_HEADER,
-    '',
-    orderedRecords.map((record) => record.lines.join('\n')).join('\n\n'),
-    '',
-  ].join('\n');
-}
-
-function buildPromotionStepPlan(repoRoot, finalFeatureContent) {
-  const stepTexts = extractFeatureStepTexts(finalFeatureContent);
-  const promotionStepFilePath = path.join(repoRoot, ...CANONICAL_PROMOTION_STEP_FILE_DISPLAY.split('/'));
-  const overrideFiles = new Map();
-  const existingDefinitions = collectStepDefinitions(repoRoot);
-  const missingStepTexts = findMissingFeatureSteps(stepTexts, existingDefinitions);
-
-  if (missingStepTexts.length === 0) {
-    return {
-      status: 'pass',
-      summary: 'existing reusable step library already covers the promoted feature.',
-      promotionStepFilePath,
-      promotionStepFileDisplay: CANONICAL_PROMOTION_STEP_FILE_DISPLAY,
-      stepAction: 'unchanged',
-      proposedFiles: overrideFiles,
-      addedExpressions: [],
-    };
-  }
-
-  const unresolvedStepTexts = [];
-  const requiredGeneratedRecords = [];
-
-  for (const stepText of missingStepTexts) {
-    const generatedRecord = resolvePromotionGeneratedStepRecord(stepText);
-    if (!generatedRecord) {
-      unresolvedStepTexts.push(stepText);
-      continue;
-    }
-
-    if (!requiredGeneratedRecords.some((record) => record.expression === generatedRecord.expression)) {
-      requiredGeneratedRecords.push(generatedRecord);
-    }
-  }
-
-  if (unresolvedStepTexts.length > 0) {
-    return {
-      status: 'fail',
-      summary: `unverifiable step coverage for ${unresolvedStepTexts.map((stepText) => `"${stepText}"`).join(', ')}.`,
-      promotionStepFilePath,
-      promotionStepFileDisplay: CANONICAL_PROMOTION_STEP_FILE_DISPLAY,
-      stepAction: 'unchanged',
-      proposedFiles: overrideFiles,
-      addedExpressions: [],
-    };
-  }
-
-  let existingGeneratedRecords = [];
-  if (pathExists(promotionStepFilePath)) {
-    const existingGeneratedContent = readText(promotionStepFilePath);
-    if (hasConflictMarkers(existingGeneratedContent)) {
-      return {
-        status: 'blocked',
-        summary: `${CANONICAL_PROMOTION_STEP_FILE_DISPLAY} contains merge conflict markers.`,
-        promotionStepFilePath,
-        promotionStepFileDisplay: CANONICAL_PROMOTION_STEP_FILE_DISPLAY,
-        stepAction: 'unchanged',
-        proposedFiles: overrideFiles,
-        addedExpressions: [],
-      };
-    }
-
-    if (!existingGeneratedContent.includes(PROMOTION_STEP_FILE_HEADER)) {
-      return {
-        status: 'blocked',
-        summary: `${CANONICAL_PROMOTION_STEP_FILE_DISPLAY} already exists outside promotion ownership.`,
-        promotionStepFilePath,
-        promotionStepFileDisplay: CANONICAL_PROMOTION_STEP_FILE_DISPLAY,
-        stepAction: 'unchanged',
-        proposedFiles: overrideFiles,
-        addedExpressions: [],
-      };
-    }
-
-    existingGeneratedRecords = extractRegisteredStepExpressions(existingGeneratedContent)
-      .map((expression) => PROMOTION_GENERATED_STEP_LIBRARY.find((record) => record.expression === expression))
-      .filter(Boolean);
-  }
-
-  const combinedGeneratedRecords = PROMOTION_GENERATED_STEP_LIBRARY.filter((candidate) =>
-    existingGeneratedRecords.some((record) => record.expression === candidate.expression)
-    || requiredGeneratedRecords.some((record) => record.expression === candidate.expression),
-  );
-  const nextGeneratedContent = buildPromotionGeneratedStepFileContent(combinedGeneratedRecords);
-  overrideFiles.set(promotionStepFilePath, nextGeneratedContent);
-
-  return {
-    status: 'pass',
-    summary: requiredGeneratedRecords.length > 0
-      ? `${pathExists(promotionStepFilePath) ? 'refined' : 'created'} reusable promotion step coverage in ${CANONICAL_PROMOTION_STEP_FILE_DISPLAY}.`
-      : 'existing reusable promotion step coverage retained.',
-    promotionStepFilePath,
-    promotionStepFileDisplay: CANONICAL_PROMOTION_STEP_FILE_DISPLAY,
-    stepAction: requiredGeneratedRecords.length > 0
-      ? pathExists(promotionStepFilePath)
-        ? 'refined'
-        : 'created'
-      : 'unchanged',
-    proposedFiles: overrideFiles,
-    addedExpressions: requiredGeneratedRecords.map((record) => record.expression),
-  };
-}
-
-function writePromotionOutcomeReport(runPaths, status, lines) {
-  writePromotionReport(runPaths.promotionReportPath, status, lines);
-  return normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.promotionReportPath));
-}
-
-function promoteAcceptedScenarioAddition(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const artifactSet = options.artifactSet;
-  const runPaths = artifactSet.runPaths;
-  const plannerHandoffRecord = options.plannerHandoffRecord || null;
-  const selectedItem = options.selectedItem || null;
-  const recordedOutcome = options.recordedOutcome || {};
-  const promotionReportPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.promotionReportPath));
-  const runtimeLogDisplayPath = options.runtimeLogPathDisplay
-    || normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.runtimeLogPath));
-  const verifierEvidence = normalizeStringList([
-    'logs/verifier.log',
-    SCENARIO_ADDITION_ARTIFACT_DISPLAY,
-    runtimeLogDisplayPath,
-  ]);
-  const selectedItemLabel = selectedItem ? `${selectedItem.id} - ${selectedItem.goal}` : 'missing';
-  const canonicalTarget = resolveCanonicalPromotionTarget(repoRoot, artifactSet, plannerHandoffRecord);
-  const scenarioHeading = resolvePromotionScenarioHeading(recordedOutcome, plannerHandoffRecord);
-
-  const baseReportLines = [
-    `Selected item: ${selectedItemLabel}`,
-    `Source artifact: ${SCENARIO_ADDITION_ARTIFACT_DISPLAY}`,
-    `Planner handoff: ${PLANNER_HANDOFF_ARTIFACT_DISPLAY}`,
-    `Promotion source: normalized.feature`,
-    `Verification evidence: ${verifierEvidence.join(', ')}`,
-  ];
-
-  if (canonicalTarget.candidateSources.length > 0) {
-    baseReportLines.push(`Target sources: ${canonicalTarget.candidateSources.join(', ')}`);
-  }
-
-  if (canonicalTarget.targetDisplayPath) {
-    baseReportLines.push(`Canonical feature target: ${canonicalTarget.targetDisplayPath}`);
-  }
-
-  if (scenarioHeading) {
-    baseReportLines.push(`Promoted scenario or outline: ${scenarioHeading}`);
-  }
-
-  const finishPromotion = (status, summary, extraLines = []) => {
-    writePromotionOutcomeReport(runPaths, status, [
-      ...baseReportLines,
-      ...extraLines,
-      `Summary: ${sanitizeInlineCode(summary)}`,
-    ]);
-
-    return {
-      status,
-      summary: sanitizeInlineCode(summary),
-      promotionReportPathDisplay,
-      canonicalFeatureTargetDisplayPath: canonicalTarget.targetDisplayPath || '',
-      promotedScenarioOrOutline: scenarioHeading,
-      promotionStepFileDisplay: '',
-      featureAction: 'unchanged',
-      stepAction: 'unchanged',
-    };
-  };
-
-  if (canonicalTarget.status !== 'pass') {
-    return finishPromotion(canonicalTarget.status, canonicalTarget.summary);
-  }
-
-  const normalizedFeatureContent = artifactSet.normalizedFeatureContent;
-  const canonicalFeatureContent = readText(canonicalTarget.targetPath);
-  if (hasConflictMarkers(normalizedFeatureContent)) {
-    return finishPromotion('blocked', 'normalized.feature contains merge conflict markers.');
-  }
-
-  if (hasConflictMarkers(canonicalFeatureContent)) {
-    return finishPromotion('blocked', `${canonicalTarget.targetDisplayPath} contains merge conflict markers.`);
-  }
-
-  const normalizedDocument = parseFeatureScenarioBlocks(normalizedFeatureContent);
-  const canonicalDocument = parseFeatureScenarioBlocks(canonicalFeatureContent);
-  const matchingNormalizedBlocks = scenarioHeading
-    ? normalizedDocument.scenarioBlocks.filter((block) => block.headingLine === scenarioHeading)
-    : [];
-  if (scenarioHeading && matchingNormalizedBlocks.length !== 1) {
-    return finishPromotion(
-      'fail',
-      `promotion could not locate exactly one ${scenarioHeading} block in normalized.feature.`,
-    );
-  }
-
-  const candidateBlock = matchingNormalizedBlocks[0] || null;
-  const candidateIndex = candidateBlock
-    ? normalizedDocument.scenarioBlocks.findIndex((block) => block.blockText === candidateBlock.blockText)
-    : -1;
-  const preambleMatches = normalizedDocument.preambleText === canonicalDocument.preambleText;
-  const normalizedWithoutCandidate = candidateIndex >= 0
-    ? normalizedDocument.scenarioBlocks.filter((_, index) => index !== candidateIndex)
-    : [];
-  const canonicalMatchesWithoutCandidate =
-    candidateIndex >= 0
-    && preambleMatches
-    && areScenarioBlockListsEquivalent(normalizedWithoutCandidate, canonicalDocument.scenarioBlocks);
-  const canonicalAlreadySynchronized =
-    preambleMatches
-    && areScenarioBlockListsEquivalent(normalizedDocument.scenarioBlocks, canonicalDocument.scenarioBlocks);
-
-  if (!canonicalAlreadySynchronized && !canonicalMatchesWithoutCandidate) {
-    return finishPromotion(
-      'blocked',
-      `promotion drift detected between normalized.feature and ${canonicalTarget.targetDisplayPath}.`,
-    );
-  }
-
-  if (!candidateBlock && !canonicalAlreadySynchronized) {
-    return finishPromotion('fail', 'promotion could not determine one bounded scenario block to promote.');
-  }
-
-  const finalCanonicalFeatureContent = `${normalizeFeatureTextForComparison(normalizedFeatureContent)}\n`;
-  const stepPlan = buildPromotionStepPlan(repoRoot, finalCanonicalFeatureContent);
-  if (stepPlan.status !== 'pass') {
-    return finishPromotion(stepPlan.status, stepPlan.summary, [
-      ...(stepPlan.promotionStepFileDisplay
-        ? [`Canonical step target: ${stepPlan.promotionStepFileDisplay}`]
-        : []),
-    ]);
-  }
-
-  const finalStepDefinitions = collectStepDefinitions(repoRoot, stepPlan.proposedFiles);
-  const unresolvedFeatureSteps = findMissingFeatureSteps(
-    extractFeatureStepTexts(finalCanonicalFeatureContent),
-    finalStepDefinitions,
-  );
-  if (unresolvedFeatureSteps.length > 0) {
-    return finishPromotion(
-      'fail',
-      `unverifiable promoted feature step coverage remains for ${unresolvedFeatureSteps.map((stepText) => `"${stepText}"`).join(', ')}.`,
-      [
-        ...(stepPlan.promotionStepFileDisplay
-          ? [`Canonical step target: ${stepPlan.promotionStepFileDisplay}`]
-          : []),
-      ],
-    );
-  }
-
-  for (const [filePath, fileContent] of stepPlan.proposedFiles.entries()) {
-    writeText(filePath, fileContent);
-  }
-
-  if (!canonicalAlreadySynchronized) {
-    writeText(canonicalTarget.targetPath, finalCanonicalFeatureContent);
-  }
-
-  const summary = canonicalAlreadySynchronized
-    ? `canonical target already synchronized for ${scenarioHeading || 'the promoted scenario'} in ${canonicalTarget.targetDisplayPath}.`
-    : `promoted ${scenarioHeading || 'one scenario'} into ${canonicalTarget.targetDisplayPath}.`;
-  const extraLines = [
-    `Feature action: ${canonicalAlreadySynchronized ? 'unchanged' : 'updated from normalized.feature'}`,
-    `Step action: ${stepPlan.stepAction}`,
-    ...(stepPlan.promotionStepFileDisplay && stepPlan.stepAction !== 'unchanged'
-      ? [`Canonical step target: ${stepPlan.promotionStepFileDisplay}`]
-      : []),
-    ...(stepPlan.addedExpressions.length > 0
-      ? [`Added reusable step expressions: ${stepPlan.addedExpressions.join(', ')}`]
-      : []),
-  ];
-  writePromotionOutcomeReport(runPaths, 'pass', [
-    ...baseReportLines,
-    ...extraLines,
-    `Summary: ${sanitizeInlineCode(summary)}`,
-  ]);
-
-  return {
-    status: 'pass',
-    summary: sanitizeInlineCode(summary),
-    promotionReportPathDisplay,
-    canonicalFeatureTargetDisplayPath: canonicalTarget.targetDisplayPath,
-    promotedScenarioOrOutline: scenarioHeading,
-    promotionStepFileDisplay: stepPlan.stepAction !== 'unchanged' ? stepPlan.promotionStepFileDisplay : '',
-    featureAction: canonicalAlreadySynchronized ? 'unchanged' : 'updated',
-    stepAction: stepPlan.stepAction,
-  };
-}
-
-function parseRuntimeAdapterOutput(stdout) {
-  const normalizedStdout = stripAnsi(stdout).trim();
-  if (!normalizedStdout) {
-    throw new Error('Runtime adapter did not emit JSON to stdout.');
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(normalizedStdout);
-  } catch (error) {
-    throw new Error(`Runtime adapter stdout did not contain valid JSON: ${sanitizeInlineCode(normalizedStdout)}`);
-  }
-
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('Runtime adapter stdout must be a JSON object.');
-  }
-
-  const status = typeof parsed.status === 'string' ? parsed.status.trim().toLowerCase() : '';
-  if (!RUNTIME_RESULT_STATUSES.has(status)) {
-    throw new Error('Runtime adapter JSON is missing a valid status.');
-  }
-
-  const requestPlaywrightBridge = parsed.requestPlaywrightBridge === true || parsed.requestBridge === true;
-  const runtimeLayer =
-    normalizeRuntimeLayer(parsed.runtimeLayer || parsed.runtime) ||
-    (requestPlaywrightBridge ? 'playwright-cli' : '');
-  const fallbackReason = typeof parsed.fallbackReason === 'string' ? parsed.fallbackReason.trim() : '';
-  if (runtimeLayer === 'mcp' && !fallbackReason) {
-    throw new Error('Runtime adapter JSON using runtimeLayer "mcp" must include fallbackReason.');
-  }
-
-  const bridgeReason = requestPlaywrightBridge
-    ? (
-      typeof parsed.bridgeReason === 'string' && parsed.bridgeReason.trim()
-        ? parsed.bridgeReason.trim()
-        : 'Playwright CLI could not complete the action; request the Playwright test/debug bridge.'
-    )
-    : '';
-  const runtimeEvidence = normalizeStringList([
-    ...normalizeStringList(parsed.evidence),
-    ...normalizeStringList(parsed.supportingEvidence),
-    ...normalizeStringList(parsed.evidenceRefs),
-    ...normalizeStringList(parsed.evidenceReferences),
-  ]);
-  const gapCandidates = normalizeGapCandidates([
-    ...(Array.isArray(parsed.gapCandidates) ? parsed.gapCandidates : []),
-    ...(Array.isArray(parsed.gaps) ? parsed.gaps : []),
-  ]);
-
-  return {
-    status,
-    summary:
-      typeof parsed.summary === 'string' && parsed.summary.trim()
-        ? parsed.summary.trim()
-        : `${status} without a runtime summary.`,
-    evidence: runtimeEvidence,
-    smallestFailingUnit: readObjectStringField(parsed, [
-      'smallestFailingUnit',
-      'smallestUnit',
-      'failingUnit',
-      'failingTarget',
-    ]),
-    rootCauseHypothesis: readObjectStringField(parsed, [
-      'rootCauseHypothesis',
-      'rootCause',
-      'hypothesis',
-    ]),
-    escalationReason: readObjectStringField(parsed, [
-      'escalationReason',
-      'escalation',
-      'manualFollowUpReason',
-    ]),
-    observedGap: readObjectStringField(parsed, [
-      'observedGap',
-      'gap',
-      'coverageGap',
-    ]),
-    candidateScenario: readObjectStringField(parsed, [
-      'candidateScenario',
-      'scenario',
-      'proposal',
-    ]),
-    additionTarget: readObjectStringField(parsed, [
-      'additionTarget',
-      'scenarioAdditionTarget',
-      'scenarioTarget',
-      'target',
-    ]),
-    addedScenarioOrOutline: readObjectStringField(parsed, [
-      'addedScenarioOrOutline',
-      'addedScenarioOutline',
-      'addedScenario',
-      'scenarioOutline',
-      'addedOutline',
-      'scenarioAdditionText',
-    ]),
-    targetArtifactPath: readObjectStringField(parsed, [
-      'targetArtifactPath',
-      'targetArtifact',
-      'artifactPath',
-      'scenarioArtifactPath',
-    ]),
-    stopReason: readObjectStringField(parsed, [
-      'stopReason',
-      'blockedReason',
-      'blockReason',
-      'stop',
-    ]),
-    blockReason: readObjectStringField(parsed, [
-      'blockReason',
-      'blockedReason',
-    ]),
-    fallbackReason,
-    runtimeLayer,
-    requestPlaywrightBridge,
-    bridgeReason,
-    gapCandidates,
-    coverageScope: normalizeCoverageScope(parsed.coverageScope || parsed.scope || parsed.featureScope),
-  };
-}
-
-function normalizeRuntimeAdapterResult(processResult) {
-  const childExitCode = processResult.status ?? 1;
-  const combinedOutput = `${processResult.stdout}\n${processResult.stderr}`;
-
-  if (childExitCode !== 0) {
-    return {
-      status: 'fail',
-      summary: summarizeOutput(combinedOutput, 'Runtime adapter exited with a non-zero status.'),
-      evidence: [],
-      smallestFailingUnit: '',
-      rootCauseHypothesis: '',
-      escalationReason: '',
-      observedGap: '',
-      candidateScenario: '',
-      additionTarget: '',
-      addedScenarioOrOutline: '',
-      targetArtifactPath: '',
-      stopReason: '',
-      blockReason: '',
-      fallbackReason: '',
-      runtimeLayer: '',
-      requestPlaywrightBridge: false,
-      bridgeReason: '',
-      gapCandidates: [],
-      coverageScope: '',
-      childExitCode,
-      stdout: processResult.stdout,
-      stderr: processResult.stderr,
-      parseError: '',
-    };
-  }
-
-  try {
-    const parsed = parseRuntimeAdapterOutput(processResult.stdout);
-    return {
-      ...parsed,
-      childExitCode,
-      stdout: processResult.stdout,
-      stderr: processResult.stderr,
-      parseError: '',
-    };
-  } catch (error) {
-    return {
-      status: 'fail',
-      summary: error instanceof Error ? error.message : String(error),
-      evidence: [],
-      smallestFailingUnit: '',
-      rootCauseHypothesis: '',
-      escalationReason: '',
-      observedGap: '',
-      candidateScenario: '',
-      additionTarget: '',
-      addedScenarioOrOutline: '',
-      targetArtifactPath: '',
-      stopReason: '',
-      blockReason: '',
-      fallbackReason: '',
-      runtimeLayer: '',
-      requestPlaywrightBridge: false,
-      bridgeReason: '',
-      gapCandidates: [],
-      coverageScope: '',
-      childExitCode,
-      stdout: processResult.stdout,
-      stderr: processResult.stderr,
-      parseError: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function invokeRuntimeProcess(invocation, processRunner) {
-  const processResult = processRunner(invocation.command, invocation.args, invocation.cwd, {
-    env: invocation.env,
-  });
-
-  return {
-    invocation,
-    processResult,
-    runtimeResult: normalizeRuntimeAdapterResult(processResult),
-    commandDisplay: formatCommandDisplay(invocation.command, invocation.args),
-  };
-}
-
-function shouldInvokePlaywrightBridge(runtimeResult) {
-  return runtimeResult.requestPlaywrightBridge === true;
-}
-
-function getRecordedFallbackReason(runtimeResult) {
-  return runtimeResult.runtimeLayer === 'mcp' ? runtimeResult.fallbackReason : '';
-}
-
-function isNoActionableProgressError(error, runId) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message === `No actionable progress items remain for run ${runId}.`;
-}
-
-function loadAdvanceRunSelection(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const artifactSet = loadRunArtifactSet({
-    repoRoot,
-    templatesDir,
-    runId,
-  });
-  const selectedItem = findNextActionableProgressItem(artifactSet.progressContent);
-
-  if (!selectedItem) {
-    throw new Error(`No actionable progress items remain for run ${runId}.`);
-  }
-
-  return {
-    selectedItemId: selectedItem.id,
-    healingItem: isHealingProgressItem(selectedItem, artifactSet.prdContent),
-    explorerItem: isExplorerProgressItem(selectedItem, artifactSet.prdContent),
-    scenarioAdditionItem: Boolean(readAcceptedPlannerHandoffRecord(artifactSet.runPaths, selectedItem.id)),
-  };
-}
-
-function iterateRun(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const adapterName = options.adapter || 'external';
-  const env = options.env || process.env;
-  const processRunner = options.processRunner || runProcess;
-  let artifactSet = loadRunArtifactSet({
-    repoRoot,
-    templatesDir,
-    runId,
-  });
-  const selectedItem = findNextActionableProgressItem(artifactSet.progressContent);
-
-  if (!selectedItem) {
-    throw new Error(`No actionable progress items remain for run ${runId}.`);
-  }
-
-  const executionControlState = resolveExecutionControls({
-    ...options,
-    artifactSet,
-    defaultProject: parseRequestedProjectValue(selectedItem.verify) || DEFAULT_EXECUTION_CONTROLS.project,
-  });
-  artifactSet = persistExecutionControls(artifactSet, executionControlState);
-  const iterateCommandDescription = buildHarnessCommandDescription('iterate-run', {
-    runId,
-    adapter: adapterName,
-    executionControls: executionControlState,
-    includeProject: executionControlState.shouldPersist,
-  });
-  const runtimeLogDisplayPath = normalizeDisplayPath(path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.runtimeLogPath));
-  const fallbackLogDisplayPath = normalizeDisplayPath(path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.fallbackLogPath));
-  const gapAnalysisPathDisplay = normalizeDisplayPath(path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.gapAnalysisPath));
-  const scenarioAdditionPathDisplay =
-    normalizeDisplayPath(path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.scenarioAdditionPath));
-  let finalStage = null;
-  let primaryStage = null;
-  let bridgeStage = null;
-  let processResult = null;
-  let runtimeResult;
-
-  try {
-    const primaryInvocation = buildRuntimeAdapterInvocation({
-      adapterName,
-      repoRoot,
-      runId,
-      runPaths: artifactSet.runPaths,
-      selectedItem,
-      env,
-      executionControls: executionControlState,
-    });
-    primaryStage = invokeRuntimeProcess(primaryInvocation, processRunner);
-    finalStage = primaryStage;
-    processResult = primaryStage.processResult;
-    runtimeResult = primaryStage.runtimeResult;
-
-    if (shouldInvokePlaywrightBridge(primaryStage.runtimeResult)) {
-      const bridgeInvocation = buildPlaywrightBridgeInvocation({
-        adapterName,
-        repoRoot,
-        runId,
-        runPaths: artifactSet.runPaths,
-        selectedItem,
-        env,
-        executionControls: executionControlState,
-        bridgeReason: primaryStage.runtimeResult.bridgeReason,
-      });
-      bridgeStage = invokeRuntimeProcess(bridgeInvocation, processRunner);
-      finalStage = bridgeStage;
-      processResult = bridgeStage.processResult;
-      runtimeResult = bridgeStage.runtimeResult;
-    }
-  } catch (error) {
-    runtimeResult = {
-      status: 'fail',
-      summary: error instanceof Error ? error.message : String(error),
-      evidence: [],
-      smallestFailingUnit: '',
-      rootCauseHypothesis: '',
-      escalationReason: '',
-      fallbackReason: '',
-      runtimeLayer: '',
-      requestPlaywrightBridge: false,
-      bridgeReason: '',
-      gapCandidates: [],
-      coverageScope: '',
-      childExitCode: processResult && processResult.status != null ? processResult.status : null,
-      stdout: processResult ? processResult.stdout : '',
-      stderr: processResult ? processResult.stderr : '',
-      parseError: '',
-    };
-  }
-
-  const commandDisplay = finalStage ? finalStage.commandDisplay : 'not constructed';
-  const stderrSummary = runtimeResult.stderr
-    ? summarizeOutput(runtimeResult.stderr, 'stderr produced no summary.')
-    : '';
-  const recordedFallbackReason = getRecordedFallbackReason(runtimeResult);
-  const bridgeUsed = Boolean(bridgeStage);
-  const healingOutcome = resolveHealingIterationOutcome({
-    selectedItem,
-    prdContent: artifactSet.prdContent,
-    runtimeResult,
-    stderrSummary,
-    attemptConsumed: Boolean(primaryStage),
-  });
-  const healingSignals = resolveHealingDiagnosisSignals(runtimeResult, healingOutcome, stderrSummary);
-  const explorerItem = isExplorerProgressItem(selectedItem, artifactSet.prdContent);
-  const plannerHandoffRecord = readAcceptedPlannerHandoffRecord(artifactSet.runPaths, selectedItem.id);
-  const scenarioAdditionItem = Boolean(plannerHandoffRecord);
-  const guidedExploration = explorerItem
-    ? resolveGuidedExplorationPlan({
-      artifactSet,
-    })
-    : { active: false };
-  const autonomousExploration = explorerItem
-    ? resolveAutonomousExplorationPlan({
-      artifactSet,
-    })
-    : { active: false };
-  const explorerScope = explorerItem
-    ? resolveExplorerScope(selectedItem, artifactSet.prdContent, runtimeResult)
-    : '';
-  const explorerSignals = explorerItem
-    ? resolveExplorerIterationSignals(runtimeResult)
-    : {
-      observedGap: '',
-      candidateScenario: '',
-      additionTarget: '',
-      supportingEvidence: [],
-      escalationReason: '',
-      stopReason: '',
-    };
-  const scenarioAdditionSignals = scenarioAdditionItem
-    ? resolveScenarioAdditionSignals(runtimeResult, artifactSet.runPaths)
-    : {
-      addedScenarioOrOutline: '',
-      targetArtifact: '',
-      supportingEvidence: [],
-      escalationReason: '',
-      stopReason: '',
-      blockReason: '',
-    };
-  const externalWorkerRole = scenarioAdditionItem
-    ? 'scenario-addition'
-    : explorerItem
-      ? 'explorer'
-      : healingOutcome.healingItem
-        ? 'healer'
-        : 'executor';
-  const externalWorkerAttemptId = `${runId}/${selectedItem.id}`;
-  const runtimeLines = [
-    `Adapter: ${adapterName}`,
-    `Runtime order: ${PLAYWRIGHT_RUNTIME_ORDER.join(' -> ')}`,
-    `Playwright bridge: ${bridgeUsed ? 'invoked' : 'not-requested'}`,
-    ...(executionControlState.shouldPersist
-      ? buildExecutionControlLogLines(executionControlState.controls)
-      : [`Project: ${executionControlState.controls.project}`]),
-    `Selected item: ${selectedItem.id} - ${selectedItem.goal}`,
-    `Selected verify step: ${selectedItem.verify}`,
-    `Working directory: ${normalizeDisplayPath(repoRoot)}`,
-    `Command: ${commandDisplay}`,
-    `Artifact paths: ${[
-      artifactSet.runPaths.prdPath,
-      artifactSet.runPaths.progressPath,
-      artifactSet.runPaths.promptPath,
-      artifactSet.runPaths.normalizedFeaturePath,
-    ]
-      .map((artifactPath) => normalizeDisplayPath(artifactPath))
-      .join(', ')}`,
-    `Child exit code: ${runtimeResult.childExitCode == null ? 'not-started' : runtimeResult.childExitCode}`,
-    `Runtime layer: ${runtimeResult.runtimeLayer || 'unspecified'}`,
-    `Parsed status: ${runtimeResult.status}`,
-    `Summary: ${sanitizeInlineCode(runtimeResult.summary)}`,
-  ];
-
-  if (primaryStage) {
-    runtimeLines.push(`Primary command: ${primaryStage.commandDisplay}`);
-    runtimeLines.push(`Primary runtime layer: ${primaryStage.runtimeResult.runtimeLayer || 'playwright-cli'}`);
-    if (primaryStage.runtimeResult.requestPlaywrightBridge) {
-      runtimeLines.push(`Bridge reason: ${sanitizeInlineCode(primaryStage.runtimeResult.bridgeReason)}`);
-    }
-  }
-
-  if (adapterName === 'external') {
-    runtimeLines.push(`Worker role: ${externalWorkerRole}`);
-    runtimeLines.push(`Worker attempt: ${sanitizeInlineCode(externalWorkerAttemptId)}`);
-  }
-
-  if (bridgeStage) {
-    runtimeLines.push(`Bridge command: ${bridgeStage.commandDisplay}`);
-    runtimeLines.push(`Bridge runtime layer: ${bridgeStage.runtimeResult.runtimeLayer || 'playwright-test'}`);
-  }
-
-  if (runtimeResult.evidence.length > 0) {
-    runtimeLines.push(`Evidence: ${runtimeResult.evidence.map(sanitizeInlineCode).join(', ')}`);
-  }
-
-  if (recordedFallbackReason) {
-    runtimeLines.push(`Fallback reason: ${sanitizeInlineCode(recordedFallbackReason)}`);
-  }
-
-  if (healingOutcome.healingItem) {
-    runtimeLines.push('Healing item: yes');
-    runtimeLines.push(`Healing attempt consumed: ${healingOutcome.attemptConsumed ? 'yes' : 'no'}`);
-    runtimeLines.push(`Retry budget before: ${healingOutcome.retryBudgetBefore}`);
-    runtimeLines.push(`Retry budget after: ${healingOutcome.retryBudgetAfter}`);
-    runtimeLines.push(`Recorded progress status: ${healingOutcome.progressStatus}`);
-    if (healingOutcome.blockReason) {
-      runtimeLines.push(`Block reason: ${sanitizeInlineCode(healingOutcome.blockReason)}`);
-    }
-    if (healingSignals.smallestFailingUnit) {
-      runtimeLines.push(`Smallest failing unit: ${sanitizeInlineCode(healingSignals.smallestFailingUnit)}`);
-    }
-    if (healingSignals.rootCauseHypothesis) {
-      runtimeLines.push(`Root-cause hypothesis: ${sanitizeInlineCode(healingSignals.rootCauseHypothesis)}`);
-    }
-    if (healingSignals.escalationReason) {
-      runtimeLines.push(`Escalation reason: ${sanitizeInlineCode(healingSignals.escalationReason)}`);
-    }
-  }
-
-  if (explorerItem) {
-    runtimeLines.push('Explorer item: yes');
-    runtimeLines.push(`Coverage scope: ${sanitizeInlineCode(explorerScope)}`);
-    runtimeLines.push(`Gap candidate count: ${runtimeResult.gapCandidates.length}`);
-    runtimeLines.push(
-      ...buildGuidedExplorationArtifactLines(guidedExploration, {
-        recordedIterationsBefore: guidedExploration.recordedIterations,
-        remainingIterationsBefore: guidedExploration.remainingIterations,
-      }),
-    );
-    runtimeLines.push(
-      ...buildAutonomousExplorationArtifactLines(autonomousExploration, {
-        recordedIterationsBefore: autonomousExploration.recordedIterations,
-        remainingIterationsBefore: autonomousExploration.remainingIterations,
-      }),
-    );
-  }
-
-  if (scenarioAdditionItem) {
-    runtimeLines.push('Scenario-addition item: yes');
-    runtimeLines.push(`Planner handoff: ${PLANNER_HANDOFF_ARTIFACT_DISPLAY}`);
-    if (plannerHandoffRecord && plannerHandoffRecord.summary) {
-      runtimeLines.push(`Planner handoff summary: ${sanitizeInlineCode(plannerHandoffRecord.summary)}`);
-    }
-    runtimeLines.push(`Target artifact: ${sanitizeInlineCode(scenarioAdditionSignals.targetArtifact)}`);
-    if (scenarioAdditionSignals.addedScenarioOrOutline) {
-      runtimeLines.push(`Added scenario or outline: ${sanitizeInlineCode(scenarioAdditionSignals.addedScenarioOrOutline)}`);
-    }
-    if (scenarioAdditionSignals.supportingEvidence.length > 0) {
-      runtimeLines.push(`Supporting evidence: ${scenarioAdditionSignals.supportingEvidence.map(sanitizeInlineCode).join(', ')}`);
-    }
-    if (scenarioAdditionSignals.escalationReason) {
-      runtimeLines.push(`Escalation reason: ${sanitizeInlineCode(scenarioAdditionSignals.escalationReason)}`);
-    }
-    if (scenarioAdditionSignals.stopReason) {
-      runtimeLines.push(`Stop reason: ${sanitizeInlineCode(scenarioAdditionSignals.stopReason)}`);
-    }
-    if (scenarioAdditionSignals.blockReason) {
-      runtimeLines.push(`Block reason: ${sanitizeInlineCode(scenarioAdditionSignals.blockReason)}`);
-    }
-  }
-
-  if (runtimeResult.parseError) {
-    runtimeLines.push(`Parse error: ${sanitizeInlineCode(runtimeResult.parseError)}`);
-  }
-
-  if (stderrSummary) {
-    runtimeLines.push(`Stderr summary: ${sanitizeInlineCode(stderrSummary)}`);
-  }
-
-  writeRuntimeLog(artifactSet.runPaths.runtimeLogPath, runtimeResult.status, runtimeLines);
-  upsertProgressItemResult(artifactSet.runPaths.progressPath, {
-    itemId: selectedItem.id,
-    status: healingOutcome.progressStatus,
-    resultText: buildProgressResultText(
-      healingOutcome.progressStatus,
-      healingOutcome.progressSummary,
-      iterateCommandDescription,
-      explorerItem
-        ? gapAnalysisPathDisplay
-        : scenarioAdditionItem
-          ? scenarioAdditionPathDisplay
-          : runtimeLogDisplayPath,
-    ),
-    retryBudget: healingOutcome.retryBudgetShouldWrite ? String(healingOutcome.retryBudgetAfter) : undefined,
-    fallbackReason: recordedFallbackReason,
-    blockReason: healingOutcome.blockReason || undefined,
-  });
-
-  if (recordedFallbackReason) {
-    writeFallbackLog(artifactSet.runPaths.fallbackLogPath, 'mcp', [
-      `Adapter: ${adapterName}`,
-      `Runtime order: ${PLAYWRIGHT_RUNTIME_ORDER.join(' -> ')}`,
-      `Selected item: ${selectedItem.id} - ${selectedItem.goal}`,
-      `Runtime layer: ${runtimeResult.runtimeLayer}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-      `Fallback log: ${fallbackLogDisplayPath}`,
-      `Fallback reason: ${sanitizeInlineCode(recordedFallbackReason)}`,
-      `Summary: ${sanitizeInlineCode(runtimeResult.summary)}`,
-    ]);
-  }
-
-  if (healingOutcome.healingItem) {
-    const healLines = [
-      `Selected item: ${selectedItem.id} - ${selectedItem.goal}`,
-      `Owner: ${selectedItem.owner || 'unspecified'}`,
-      `Worker role: healer`,
-      `Worker attempt: ${sanitizeInlineCode(externalWorkerAttemptId)}`,
-      `Retry budget: ${healingOutcome.retryBudgetBefore} -> ${healingOutcome.retryBudgetAfter}`,
-      `Runtime status: ${runtimeResult.status}`,
-      `Recorded status: ${healingOutcome.progressStatus}`,
-      `Runtime layer: ${runtimeResult.runtimeLayer || 'unspecified'}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-    ];
-
-    if (healingSignals.smallestFailingUnit) {
-      healLines.push(`Smallest failing unit: ${sanitizeInlineCode(healingSignals.smallestFailingUnit)}`);
-    }
-
-    if (healingSignals.rootCauseHypothesis) {
-      healLines.push(`Root-cause hypothesis: ${sanitizeInlineCode(healingSignals.rootCauseHypothesis)}`);
-    }
-
-    if (healingSignals.escalationReason) {
-      healLines.push(`Escalation reason: ${sanitizeInlineCode(healingSignals.escalationReason)}`);
-    }
-
-    if (recordedFallbackReason) {
-      healLines.push(`Fallback reason: ${sanitizeInlineCode(recordedFallbackReason)}`);
-    }
-
-    if (healingOutcome.blockReason) {
-      healLines.push(`Block reason: ${sanitizeInlineCode(healingOutcome.blockReason)}`);
-    }
-
-    healLines.push(`Summary: ${sanitizeInlineCode(runtimeResult.summary)}`);
-    writeHealReport(artifactSet.runPaths.healReportPath, healingOutcome.progressStatus, healLines);
-  }
-
-  if (explorerItem) {
-    const guidedIterationsAfter = guidedExploration.active
-      ? guidedExploration.recordedIterations + 1
-      : null;
-    const guidedRemainingAfter = guidedExploration.active && guidedExploration.iterationBudget != null
-      ? Math.max(guidedExploration.iterationBudget - guidedIterationsAfter, 0)
-      : null;
-    const autonomousIterationsAfter = autonomousExploration.active
-      ? autonomousExploration.recordedIterations + 1
-      : null;
-    const autonomousRemainingAfter = autonomousExploration.active && autonomousExploration.iterationBudget != null
-      ? Math.max(autonomousExploration.iterationBudget - autonomousIterationsAfter, 0)
-      : null;
-    const gapLines = [
-      `Selected item: ${selectedItem.id} - ${selectedItem.goal}`,
-      `Worker role: explorer`,
-      `Worker attempt: ${sanitizeInlineCode(externalWorkerAttemptId)}`,
-      `Scope: ${sanitizeInlineCode(explorerScope)}`,
-      `Runtime status: ${healingOutcome.progressStatus}`,
-      `Runtime layer: ${runtimeResult.runtimeLayer || 'unspecified'}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-      `Candidate count: ${runtimeResult.gapCandidates.length}`,
-      ...buildGuidedExplorationArtifactLines(guidedExploration, {
-        recordedIterationsBefore: guidedExploration.recordedIterations,
-        recordedIterationsAfter: guidedIterationsAfter,
-        remainingIterationsBefore: guidedExploration.remainingIterations,
-        remainingIterationsAfter: guidedRemainingAfter,
-      }),
-      ...buildAutonomousExplorationArtifactLines(autonomousExploration, {
-        recordedIterationsBefore: autonomousExploration.recordedIterations,
-        recordedIterationsAfter: autonomousIterationsAfter,
-        remainingIterationsBefore: autonomousExploration.remainingIterations,
-        remainingIterationsAfter: autonomousRemainingAfter,
-      }),
-    ];
-
-    if (runtimeResult.evidence.length > 0) {
-      gapLines.push(`Runtime evidence: ${runtimeResult.evidence.map(sanitizeInlineCode).join(', ')}`);
-    }
-
-    if (explorerSignals.observedGap) {
-      gapLines.push(`Observed gap: ${sanitizeInlineCode(explorerSignals.observedGap)}`);
-    }
-
-    if (explorerSignals.candidateScenario) {
-      gapLines.push(`Candidate scenario: ${sanitizeInlineCode(explorerSignals.candidateScenario)}`);
-    }
-
-    if (explorerSignals.additionTarget) {
-      gapLines.push(`Candidate addition target: ${sanitizeInlineCode(explorerSignals.additionTarget)}`);
-    }
-
-    if (explorerSignals.supportingEvidence.length > 0) {
-      gapLines.push(`Supporting evidence: ${explorerSignals.supportingEvidence.map(sanitizeInlineCode).join(', ')}`);
-    }
-
-    if (recordedFallbackReason) {
-      gapLines.push(`Fallback reason: ${sanitizeInlineCode(recordedFallbackReason)}`);
-    }
-
-    if (explorerSignals.escalationReason) {
-      gapLines.push(`Escalation reason: ${sanitizeInlineCode(explorerSignals.escalationReason)}`);
-    }
-
-    if (explorerSignals.stopReason) {
-      gapLines.push(`Stop reason: ${sanitizeInlineCode(explorerSignals.stopReason)}`);
-    }
-
-    runtimeResult.gapCandidates.forEach((candidate, index) => {
-      const ordinal = index + 1;
-      if (candidate.gap) {
-        gapLines.push(`Candidate ${ordinal} gap: ${candidate.gap}`);
-      }
-      if (candidate.candidateScenario) {
-        gapLines.push(`Candidate ${ordinal} scenario: ${candidate.candidateScenario}`);
-      }
-      if (candidate.additionTarget) {
-        gapLines.push(`Candidate ${ordinal} addition target: ${candidate.additionTarget}`);
-      }
-      if (candidate.evidence.length > 0) {
-        gapLines.push(`Candidate ${ordinal} evidence: ${candidate.evidence.join(', ')}`);
-      }
-    });
-
-    gapLines.push(`Summary: ${sanitizeInlineCode(runtimeResult.summary)}`);
-    writeGapAnalysisReport(artifactSet.runPaths.gapAnalysisPath, healingOutcome.progressStatus, gapLines);
-  }
-
-  if (scenarioAdditionItem) {
-    const scenarioAdditionLines = [
-      `Selected item: ${selectedItem.id} - ${selectedItem.goal}`,
-      `Worker role: scenario-addition`,
-      `Worker attempt: ${sanitizeInlineCode(externalWorkerAttemptId)}`,
-      `Planner handoff: ${PLANNER_HANDOFF_ARTIFACT_DISPLAY}`,
-      `Runtime status: ${healingOutcome.progressStatus}`,
-      `Runtime layer: ${runtimeResult.runtimeLayer || 'unspecified'}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-      `Target artifact: ${sanitizeInlineCode(scenarioAdditionSignals.targetArtifact)}`,
-    ];
-
-    if (plannerHandoffRecord && plannerHandoffRecord.summary) {
-      scenarioAdditionLines.push(`Accepted handoff summary: ${sanitizeInlineCode(plannerHandoffRecord.summary)}`);
-    }
-
-    if (plannerHandoffRecord && plannerHandoffRecord.candidateScenario) {
-      scenarioAdditionLines.push(`Planner candidate scenario: ${sanitizeInlineCode(plannerHandoffRecord.candidateScenario)}`);
-    }
-
-    if (plannerHandoffRecord && plannerHandoffRecord.candidateAdditionTarget) {
-      scenarioAdditionLines.push(
-        `Planner addition target: ${sanitizeInlineCode(plannerHandoffRecord.candidateAdditionTarget)}`,
-      );
-    }
-
-    if (scenarioAdditionSignals.addedScenarioOrOutline) {
-      scenarioAdditionLines.push(
-        `Added scenario or outline: ${sanitizeInlineCode(scenarioAdditionSignals.addedScenarioOrOutline)}`,
-      );
-    }
-
-    if (scenarioAdditionSignals.supportingEvidence.length > 0) {
-      scenarioAdditionLines.push(
-        `Supporting evidence: ${scenarioAdditionSignals.supportingEvidence.map(sanitizeInlineCode).join(', ')}`,
-      );
-    }
-
-    if (recordedFallbackReason) {
-      scenarioAdditionLines.push(`Fallback reason: ${sanitizeInlineCode(recordedFallbackReason)}`);
-    }
-
-    if (scenarioAdditionSignals.escalationReason) {
-      scenarioAdditionLines.push(`Escalation reason: ${sanitizeInlineCode(scenarioAdditionSignals.escalationReason)}`);
-    }
-
-    if (scenarioAdditionSignals.stopReason) {
-      scenarioAdditionLines.push(`Stop reason: ${sanitizeInlineCode(scenarioAdditionSignals.stopReason)}`);
-    }
-
-    if (scenarioAdditionSignals.blockReason) {
-      scenarioAdditionLines.push(`Block reason: ${sanitizeInlineCode(scenarioAdditionSignals.blockReason)}`);
-    }
-
-    scenarioAdditionLines.push(`Summary: ${sanitizeInlineCode(runtimeResult.summary)}`);
-    writeScenarioAdditionReport(
-      artifactSet.runPaths.scenarioAdditionPath,
-      healingOutcome.progressStatus,
-      scenarioAdditionLines,
-    );
-  }
-
-  return {
-    runId,
-    runPaths: artifactSet.runPaths,
-    adapter: adapterName,
-    executionControls: executionControlState.controls,
-    selectedItemId: selectedItem.id,
-    selectedItemGoal: selectedItem.goal,
-    status: healingOutcome.progressStatus,
-    summary: healingOutcome.progressSummary,
-    command: commandDisplay,
-    runtimeLayer: runtimeResult.runtimeLayer,
-    bridgeUsed,
-    healingItem: healingOutcome.healingItem,
-    explorerItem,
-    scenarioAdditionItem,
-    fallbackReason: recordedFallbackReason,
-    runtimeLogPathDisplay: runtimeLogDisplayPath,
-    fallbackLogPathDisplay: fallbackLogDisplayPath,
-    gapAnalysisPathDisplay: explorerItem ? gapAnalysisPathDisplay : '',
-    scenarioAdditionPathDisplay: scenarioAdditionItem ? scenarioAdditionPathDisplay : '',
-    healReportPathDisplay: healingOutcome.healingItem
-      ? normalizeDisplayPath(path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.healReportPath))
-      : '',
-  };
-}
-
-function readAdvanceRunRecordedOutcome(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const selectedItemId = options.selectedItemId || '';
-  const runPaths = resolveRunPaths(repoRoot, runId);
-  const runtimeLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.runtimeLogPath));
-  const fallbackLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.fallbackLogPath));
-  const gapAnalysisPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.gapAnalysisPath));
-  const promotionReportPathDisplay =
-    normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.promotionReportPath));
-  const scenarioAdditionPathDisplay =
-    normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.scenarioAdditionPath));
-  const healReportPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.healReportPath));
-  const verifierLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.verifierLogPath));
-  const artifactSet = loadRunArtifactSet({
-    repoRoot,
-    templatesDir,
-    runId,
-  });
-  const selectedItem = selectedItemId
-    ? findProgressItem(artifactSet.progressContent, (item) => item.id === selectedItemId)
-    : null;
-  const plannerHandoffRecord = selectedItem ? readAcceptedPlannerHandoffRecord(artifactSet.runPaths, selectedItem.id) : null;
-  const healingItem = Boolean(selectedItem && isHealingProgressItem(selectedItem, artifactSet.prdContent));
-  const explorerItem = Boolean(selectedItem && isExplorerProgressItem(selectedItem, artifactSet.prdContent));
-  const scenarioAdditionItem = Boolean(selectedItem && plannerHandoffRecord);
-  const runtimeEntry = readLatestStructuredLogEntry(artifactSet.runPaths.runtimeLogPath);
-  const fallbackEntry = readLatestStructuredLogEntry(artifactSet.runPaths.fallbackLogPath);
-  const gapEntry = readLatestStructuredLogEntry(artifactSet.runPaths.gapAnalysisPath);
-  const scenarioAdditionEntry = readLatestStructuredLogEntry(artifactSet.runPaths.scenarioAdditionPath);
-  const healEntry = readLatestStructuredLogEntry(artifactSet.runPaths.healReportPath);
-  const runtimeSelectedItem = readStructuredLogValue(runtimeEntry, 'Selected item');
-  const runtimeAdapter = readStructuredLogValue(runtimeEntry, 'Adapter');
-  const runtimeSummary = readStructuredLogValue(runtimeEntry, 'Summary');
-  const fallbackEntrySelectedItem = readStructuredLogValue(fallbackEntry, 'Selected item');
-  const gapEntrySelectedItem = readStructuredLogValue(gapEntry, 'Selected item');
-  const scenarioAdditionEntrySelectedItem = readStructuredLogValue(scenarioAdditionEntry, 'Selected item');
-  const healEntrySelectedItem = readStructuredLogValue(healEntry, 'Selected item');
-  const fallbackReason =
-    selectedItem && fallbackEntrySelectedItem.startsWith(`${selectedItem.id} -`)
-      ? readStructuredLogValue(fallbackEntry, 'Fallback reason')
-      : selectedItem
-        ? selectedItem.fallbackReason
-        : '';
-  const healReportMatched = Boolean(selectedItem && healEntrySelectedItem.startsWith(`${selectedItem.id} -`));
-  const gapAnalysisMatched = Boolean(
-    selectedItem && explorerItem && gapEntrySelectedItem.startsWith(`${selectedItem.id} -`),
-  );
-  const scenarioAdditionMatched = Boolean(
-    selectedItem && scenarioAdditionItem && scenarioAdditionEntrySelectedItem.startsWith(`${selectedItem.id} -`),
-  );
-  const healBlockReason = healReportMatched
-    ? readStructuredLogValue(healEntry, 'Block reason')
-    : selectedItem
-      ? selectedItem.blockReason
-      : '';
-
-  return {
-    artifactSet,
-    selectedItem,
-    plannerHandoffRecord,
-    healingItem,
-    explorerItem,
-    scenarioAdditionItem,
-    runtimeEntry,
-    fallbackEntry,
-    gapEntry,
-    scenarioAdditionEntry,
-    healEntry,
-    runtimeSelectedItem,
-    runtimeAdapter,
-    runtimeSummary,
-    fallbackReason,
-    gapAnalysisMatched,
-    gapAnalysisScope: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Scope') : '',
-    gapAnalysisSummary: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Summary') : '',
-    gapAnalysisCandidateCount: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Candidate count') : '',
-    gapAnalysisObservedGap: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Observed gap') : '',
-    gapAnalysisCandidateScenario: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Candidate scenario') : '',
-    gapAnalysisAdditionTarget: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Candidate addition target') : '',
-    gapAnalysisSupportingEvidence: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Supporting evidence') : '',
-    gapAnalysisEscalationReason: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Escalation reason') : '',
-    gapAnalysisStopReason: gapAnalysisMatched ? readStructuredLogValue(gapEntry, 'Stop reason') : '',
-    scenarioAdditionMatched,
-    scenarioAdditionSummary: scenarioAdditionMatched ? readStructuredLogValue(scenarioAdditionEntry, 'Summary') : '',
-    scenarioAdditionAddedScenarioOrOutline: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Added scenario or outline')
-      : '',
-    scenarioAdditionTargetArtifact: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Target artifact')
-      : '',
-    scenarioAdditionSupportingEvidence: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Supporting evidence')
-      : '',
-    scenarioAdditionEscalationReason: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Escalation reason')
-      : '',
-    scenarioAdditionStopReason: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Stop reason')
-      : '',
-    scenarioAdditionBlockReason: scenarioAdditionMatched
-      ? readStructuredLogValue(scenarioAdditionEntry, 'Block reason')
-      : '',
-    healRecordedStatus: healReportMatched
-      ? readStructuredLogValue(healEntry, 'Recorded status') || healEntry.status
-      : '',
-    healRuntimeStatus: healReportMatched ? readStructuredLogValue(healEntry, 'Runtime status') : '',
-    healSummary: healReportMatched ? readStructuredLogValue(healEntry, 'Summary') : '',
-    healSmallestFailingUnit: healReportMatched ? readStructuredLogValue(healEntry, 'Smallest failing unit') : '',
-    healRootCauseHypothesis: healReportMatched ? readStructuredLogValue(healEntry, 'Root-cause hypothesis') : '',
-    healEscalationReason: healReportMatched ? readStructuredLogValue(healEntry, 'Escalation reason') : '',
-    healBlockReason,
-    healReportMatched,
-    runtimeLogDisplayPath,
-    fallbackLogPathDisplay: fallbackLogDisplayPath,
-    gapAnalysisPathDisplay,
-    promotionReportPathDisplay,
-    scenarioAdditionPathDisplay,
-    healReportPathDisplay,
-    verifierLogPathDisplay: verifierLogDisplayPath,
-  };
-}
-
-function reviewAdvanceRunExecutionResult(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const adapterName = options.adapter || 'external';
-  const iterationResult = options.iterationResult || {};
-  const runPaths = resolveRunPaths(repoRoot, runId);
-  const runtimeLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.runtimeLogPath));
-  const fallbackLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.fallbackLogPath));
-  const gapAnalysisPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.gapAnalysisPath));
-  const healReportPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.healReportPath));
-
-  try {
-    const selectedItemId = options.selectedItemId || iterationResult.selectedItemId || '';
-    const recordedOutcome = readAdvanceRunRecordedOutcome({
-      repoRoot,
-      templatesDir,
-      runId,
-      selectedItemId,
-    });
-    const selectedItem = recordedOutcome.selectedItem;
-    const runtimeEntry = recordedOutcome.runtimeEntry;
-    const recordedStatus = selectedItem ? selectedItem.status : iterationResult.status || '';
-    const explorerItem = recordedOutcome.explorerItem;
-    const scenarioAdditionItem = recordedOutcome.scenarioAdditionItem;
-    let executorSummary = '';
-
-    if (!selectedItemId) {
-      executorSummary = 'executor completed without a selected item id.';
-    } else if (!selectedItem) {
-      executorSummary = `executor did not record selected item ${selectedItemId} in progress.md.`;
-    } else if (!runtimeEntry) {
-      executorSummary = `executor recorded ${recordedStatus || 'result'} without runtime proof in ${runtimeLogDisplayPath}.`;
-    } else if (recordedOutcome.runtimeSelectedItem && !recordedOutcome.runtimeSelectedItem.startsWith(`${selectedItem.id} -`)) {
-      executorSummary =
-        `executor recorded ${recordedStatus || 'result'} for ${selectedItem.id}, ` +
-        `but runtime proof is for ${recordedOutcome.runtimeSelectedItem}.`;
-    } else if (recordedOutcome.runtimeAdapter && recordedOutcome.runtimeAdapter !== adapterName) {
-      executorSummary = `executor recorded ${recordedStatus || 'result'} with adapter mismatch (${recordedOutcome.runtimeAdapter}).`;
-    } else if (scenarioAdditionItem && recordedStatus === 'pass' && !recordedOutcome.scenarioAdditionMatched) {
-      executorSummary =
-        `executor recorded pass without scenario addition artifact in ${recordedOutcome.scenarioAdditionPathDisplay}.`;
-    } else if (explorerItem && recordedStatus === 'pass' && !recordedOutcome.gapAnalysisMatched) {
-      executorSummary = `explorer recorded pass without gap analysis in ${recordedOutcome.gapAnalysisPathDisplay}.`;
-    } else {
-      const runtimeDetail = recordedOutcome.runtimeSummary || iterationResult.summary || 'runtime summary unavailable.';
-
-      if (recordedStatus === 'pass') {
-        if (scenarioAdditionItem) {
-          executorSummary =
-            `recorded pass from ${recordedOutcome.scenarioAdditionPathDisplay}: ` +
-            `${formatScenarioAdditionSummary(recordedOutcome, runtimeDetail)}`;
-        } else if (explorerItem) {
-          executorSummary =
-            `recorded pass from ${recordedOutcome.gapAnalysisPathDisplay}: ` +
-            `${formatExplorerGapAnalysisSummary(recordedOutcome, runtimeDetail)}`;
-        } else if (recordedOutcome.healingItem && recordedOutcome.healReportMatched) {
-          executorSummary =
-            `recorded pass from ${recordedOutcome.healReportPathDisplay}: ` +
-            `${formatHealingReportSummary(recordedOutcome, runtimeDetail)}`;
-        } else {
-          executorSummary = `recorded pass from ${runtimeLogDisplayPath}: ${runtimeDetail}`;
-        }
-      } else if (recordedStatus === 'blocked') {
-        const blockedEvidencePathDisplay =
-          recordedOutcome.healingItem && recordedOutcome.healReportMatched
-            ? healReportPathDisplay
-            : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-              ? recordedOutcome.scenarioAdditionPathDisplay
-            : explorerItem && recordedOutcome.gapAnalysisMatched
-              ? recordedOutcome.gapAnalysisPathDisplay
-              : runtimeLogDisplayPath;
-        executorSummary =
-          `recorded blocked from ${blockedEvidencePathDisplay}: ` +
-          `${
-            recordedOutcome.healingItem && recordedOutcome.healReportMatched
-              ? recordedOutcome.healBlockReason || selectedItem.blockReason || runtimeDetail
-              : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-                ? recordedOutcome.scenarioAdditionBlockReason
-                  || recordedOutcome.scenarioAdditionStopReason
-                  || formatScenarioAdditionSummary(recordedOutcome, runtimeDetail)
-              : explorerItem && recordedOutcome.gapAnalysisMatched
-                ? formatExplorerGapAnalysisSummary(recordedOutcome, runtimeDetail)
-                : runtimeDetail
-          }`;
-      } else if (recordedStatus === 'fail') {
-        const evidencePathDisplay =
-          recordedOutcome.healingItem && recordedOutcome.healReportMatched
-            ? recordedOutcome.healReportPathDisplay
-            : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-              ? recordedOutcome.scenarioAdditionPathDisplay
-            : explorerItem && recordedOutcome.gapAnalysisMatched
-              ? recordedOutcome.gapAnalysisPathDisplay
-              : runtimeLogDisplayPath;
-        executorSummary =
-          `recorded fail from ${evidencePathDisplay}: ` +
-          `${
-            recordedOutcome.healingItem && recordedOutcome.healReportMatched
-              ? formatHealingReportSummary(recordedOutcome, runtimeDetail)
-              : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-                ? formatScenarioAdditionSummary(recordedOutcome, runtimeDetail)
-              : explorerItem && recordedOutcome.gapAnalysisMatched
-              ? formatExplorerGapAnalysisSummary(recordedOutcome, runtimeDetail)
-              : runtimeDetail
-          }`;
-      } else {
-        executorSummary = `executor recorded unexpected status "${recordedStatus || 'missing'}".`;
-      }
-
-      if (recordedOutcome.fallbackReason) {
-        executorSummary += `; fallback in ${fallbackLogDisplayPath}: ${recordedOutcome.fallbackReason}`;
-      }
-    }
-
-    return {
-      status: recordedStatus || iterationResult.status || 'fail',
-      summary: executorSummary,
-      selectedItemId: selectedItem ? selectedItem.id : selectedItemId,
-      healingItem: recordedOutcome.healingItem,
-      explorerItem,
-      scenarioAdditionItem,
-      runtimeLogPathDisplay: runtimeLogDisplayPath,
-      fallbackLogPathDisplay: fallbackLogDisplayPath,
-      gapAnalysisPathDisplay: recordedOutcome.gapAnalysisPathDisplay,
-      scenarioAdditionPathDisplay: recordedOutcome.scenarioAdditionPathDisplay,
-      healReportPathDisplay,
-    };
-  } catch (error) {
-    return {
-      status: iterationResult.status || 'fail',
-      summary: sanitizeInlineCode(error instanceof Error ? error.message : String(error)),
-      selectedItemId: iterationResult.selectedItemId || '',
-      runtimeLogPathDisplay: runtimeLogDisplayPath,
-      fallbackLogPathDisplay: fallbackLogDisplayPath,
-      gapAnalysisPathDisplay,
-      scenarioAdditionPathDisplay,
-      healReportPathDisplay,
-    };
-  }
-}
-
-function reviewAdvanceRunResult(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const adapterName = options.adapter || 'external';
-  const iterationResult = options.iterationResult || {};
-  const executionReviewResult = options.executionReviewResult || {};
-  const runPaths = resolveRunPaths(repoRoot, runId);
-  const runtimeLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.runtimeLogPath));
-  const gapAnalysisPathDisplay = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.gapAnalysisPath));
-  const scenarioAdditionPathDisplay =
-    normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.scenarioAdditionPath));
-  const promotionReportPathDisplay =
-    normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.promotionReportPath));
-  const verifierLogDisplayPath = normalizeDisplayPath(path.relative(runPaths.runDir, runPaths.verifierLogPath));
-  let advanceCommandDescription = buildHarnessCommandDescription('advance-run', {
-    runId,
-    adapter: adapterName,
-    executionControls: resolveExecutionControls({
-      ...options,
-      defaultProject: DEFAULT_EXECUTION_CONTROLS.project,
-    }),
-    includeProject: false,
-  });
-
-  try {
-    const selectedItemId = options.selectedItemId || executionReviewResult.selectedItemId || iterationResult.selectedItemId || '';
-    const recordedOutcome = readAdvanceRunRecordedOutcome({
-      repoRoot,
-      templatesDir,
-      runId,
-      selectedItemId,
-    });
-    const artifactSet = recordedOutcome.artifactSet;
-    const selectedItem = recordedOutcome.selectedItem;
-    const executionControlState = resolveExecutionControls({
-      ...options,
-      artifactSet,
-      defaultProject:
-        (selectedItem && parseRequestedProjectValue(selectedItem.verify)) || DEFAULT_EXECUTION_CONTROLS.project,
-    });
-    advanceCommandDescription = buildHarnessCommandDescription('advance-run', {
-      runId,
-      adapter: adapterName,
-      executionControls: executionControlState,
-      includeProject: executionControlState.shouldPersist,
-    });
-    const runtimeEntry = recordedOutcome.runtimeEntry;
-    const recordedStatus = selectedItem ? selectedItem.status : '';
-    const runtimeLogStatus = runtimeEntry ? runtimeEntry.status : '';
-    const baseSummary = recordedOutcome.runtimeSummary || iterationResult.summary || 'runtime summary unavailable.';
-    const explorerItem = recordedOutcome.explorerItem;
-    const scenarioAdditionItem = recordedOutcome.scenarioAdditionItem;
-    const guidedExploration = explorerItem
-      ? resolveGuidedExplorationPlan({
-        artifactSet,
-      })
-      : { active: false };
-    const autonomousExploration = explorerItem
-      ? resolveAutonomousExplorationPlan({
-        artifactSet,
-      })
-      : { active: false };
-    let verifierStatus = 'fail';
-    let verifierSummary = '';
-    let promotionResult = null;
-
-    if (!selectedItemId) {
-      verifierSummary = 'advance-run completed without a selected item id.';
-    } else if (!selectedItem) {
-      verifierSummary = `selected item ${selectedItemId} was not recorded in progress.md.`;
-    } else if (!runtimeEntry) {
-      verifierSummary = `verifier rejected recorded ${recordedStatus || 'result'}: runtime proof missing in ${runtimeLogDisplayPath}.`;
-    } else if (recordedOutcome.runtimeSelectedItem && !recordedOutcome.runtimeSelectedItem.startsWith(`${selectedItem.id} -`)) {
-      verifierSummary =
-        `verifier rejected recorded ${recordedStatus || 'result'}: ` +
-        `runtime proof is for ${recordedOutcome.runtimeSelectedItem}.`;
-    } else if (recordedOutcome.runtimeAdapter && recordedOutcome.runtimeAdapter !== adapterName) {
-      verifierSummary =
-        `verifier rejected recorded ${recordedStatus || 'result'}: ` +
-        `runtime adapter mismatch (${recordedOutcome.runtimeAdapter}).`;
-    } else if (scenarioAdditionItem && recordedStatus === 'pass' && !recordedOutcome.scenarioAdditionMatched) {
-      verifierSummary =
-        `verifier rejected recorded pass: scenario addition missing in ${recordedOutcome.scenarioAdditionPathDisplay}.`;
-    } else if (explorerItem && recordedStatus === 'pass' && !recordedOutcome.gapAnalysisMatched) {
-      verifierSummary =
-        `verifier rejected recorded pass: gap analysis missing in ${recordedOutcome.gapAnalysisPathDisplay}.`;
-    } else if (recordedStatus === 'pass') {
-      if (runtimeLogStatus !== 'pass') {
-        verifierSummary = `verifier rejected recorded pass: runtime log status is ${runtimeLogStatus || 'missing'}.`;
-      } else {
-        if (scenarioAdditionItem) {
-          promotionResult = promoteAcceptedScenarioAddition({
-            repoRoot,
-            artifactSet,
-            selectedItem,
-            plannerHandoffRecord: recordedOutcome.plannerHandoffRecord,
-            recordedOutcome,
-            runtimeLogPathDisplay: runtimeLogDisplayPath,
-          });
-          verifierStatus = promotionResult.status;
-          if (promotionResult.status === 'pass') {
-            verifierSummary =
-              `verifier accepted pass from ${recordedOutcome.scenarioAdditionPathDisplay}: ` +
-              `${formatScenarioAdditionSummary(recordedOutcome, baseSummary)}; ` +
-              `promotion in ${promotionResult.promotionReportPathDisplay}: ${promotionResult.summary}`;
-          } else if (promotionResult.status === 'blocked') {
-            verifierSummary =
-              `verifier blocked recorded pass: canonical promotion blocked in ` +
-              `${promotionResult.promotionReportPathDisplay}: ${promotionResult.summary}`;
-          } else {
-            verifierSummary =
-              `verifier rejected recorded pass: canonical promotion failed in ` +
-              `${promotionResult.promotionReportPathDisplay}: ${promotionResult.summary}`;
-          }
-        } else if (explorerItem) {
-          verifierStatus = 'pass';
-          verifierSummary =
-            `verifier accepted pass from ${recordedOutcome.gapAnalysisPathDisplay}: ` +
-            `${formatExplorerGapAnalysisSummary(recordedOutcome, baseSummary)}`;
-        } else if (recordedOutcome.healingItem && recordedOutcome.healReportMatched) {
-          verifierStatus = 'pass';
-          verifierSummary =
-            `verifier accepted pass from ${recordedOutcome.healReportPathDisplay}: ` +
-            `${formatHealingReportSummary(recordedOutcome, baseSummary)}`;
-        } else {
-          verifierStatus = 'pass';
-          verifierSummary = `verifier accepted pass from ${runtimeLogDisplayPath}: ${baseSummary}`;
-        }
-      }
-    } else if (recordedStatus === 'blocked') {
-      verifierStatus = 'blocked';
-      const blockedEvidencePathDisplay =
-        recordedOutcome.healingItem && recordedOutcome.healReportMatched
-          ? recordedOutcome.healReportPathDisplay
-          : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-            ? recordedOutcome.scenarioAdditionPathDisplay
-          : explorerItem && recordedOutcome.gapAnalysisMatched
-            ? recordedOutcome.gapAnalysisPathDisplay
-            : runtimeLogDisplayPath;
-      verifierSummary =
-        `verifier confirmed blocked from ${blockedEvidencePathDisplay}: ` +
-        `${
-          recordedOutcome.healingItem && recordedOutcome.healReportMatched
-            ? recordedOutcome.healBlockReason || selectedItem.blockReason || baseSummary
-            : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-              ? recordedOutcome.scenarioAdditionBlockReason
-                || recordedOutcome.scenarioAdditionStopReason
-                || formatScenarioAdditionSummary(recordedOutcome, baseSummary)
-            : explorerItem && recordedOutcome.gapAnalysisMatched
-              ? formatExplorerGapAnalysisSummary(recordedOutcome, baseSummary)
-              : baseSummary
-        }`;
-    } else if (recordedStatus === 'fail') {
-      verifierStatus = 'fail';
-      const evidencePathDisplay =
-        recordedOutcome.healingItem && recordedOutcome.healReportMatched
-          ? recordedOutcome.healReportPathDisplay
-          : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-            ? recordedOutcome.scenarioAdditionPathDisplay
-          : explorerItem && recordedOutcome.gapAnalysisMatched
-            ? recordedOutcome.gapAnalysisPathDisplay
-            : runtimeLogDisplayPath;
-      verifierSummary =
-        `verifier confirmed fail from ${evidencePathDisplay}: ` +
-        `${
-          recordedOutcome.healingItem && recordedOutcome.healReportMatched
-            ? formatHealingReportSummary(recordedOutcome, baseSummary)
-            : scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-              ? formatScenarioAdditionSummary(recordedOutcome, baseSummary)
-            : explorerItem && recordedOutcome.gapAnalysisMatched
-            ? formatExplorerGapAnalysisSummary(recordedOutcome, baseSummary)
-            : baseSummary
-        }`;
-      if (recordedOutcome.fallbackReason) {
-        verifierSummary +=
-          `; fallback in ${recordedOutcome.fallbackLogPathDisplay}: ${recordedOutcome.fallbackReason}`;
-      }
-    } else {
-      verifierSummary = `verifier rejected recorded result: unexpected progress status "${recordedStatus || 'missing'}".`;
-    }
-
-    const verifierLines = [
-      `Selected item: ${selectedItem ? `${selectedItem.id} - ${selectedItem.goal}` : selectedItemId || 'missing'}`,
-      `Adapter: ${adapterName}`,
-      `Recorded item status: ${recordedStatus || 'missing'}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-      `Runtime log status: ${runtimeLogStatus || 'missing'}`,
-    ];
-    if (executionControlState.shouldPersist) {
-      verifierLines.push(...buildExecutionControlLogLines(executionControlState.controls));
-    }
-
-    if (recordedOutcome.runtimeSelectedItem) {
-      verifierLines.push(`Runtime proof item: ${sanitizeInlineCode(recordedOutcome.runtimeSelectedItem)}`);
-    }
-
-    if (recordedOutcome.healingItem) {
-      verifierLines.push('Healing item: yes');
-      verifierLines.push(`Heal report: ${recordedOutcome.healReportPathDisplay}`);
-      if (recordedOutcome.healRecordedStatus) {
-        verifierLines.push(`Heal report status: ${sanitizeInlineCode(recordedOutcome.healRecordedStatus)}`);
-      }
-      if (recordedOutcome.healRuntimeStatus) {
-        verifierLines.push(`Heal report runtime status: ${sanitizeInlineCode(recordedOutcome.healRuntimeStatus)}`);
-      }
-      if (recordedOutcome.healSmallestFailingUnit) {
-        verifierLines.push(
-          `Heal report smallest failing unit: ${sanitizeInlineCode(recordedOutcome.healSmallestFailingUnit)}`,
-        );
-      }
-      if (recordedOutcome.healRootCauseHypothesis) {
-        verifierLines.push(
-          `Heal report root-cause hypothesis: ${sanitizeInlineCode(recordedOutcome.healRootCauseHypothesis)}`,
-        );
-      }
-      if (recordedOutcome.healEscalationReason) {
-        verifierLines.push(
-          `Heal report escalation reason: ${sanitizeInlineCode(recordedOutcome.healEscalationReason)}`,
-        );
-      }
-    }
-
-    if (recordedOutcome.scenarioAdditionItem) {
-      verifierLines.push('Scenario-addition item: yes');
-      verifierLines.push(`Planner handoff: ${PLANNER_HANDOFF_ARTIFACT_DISPLAY}`);
-      verifierLines.push(`Scenario addition: ${recordedOutcome.scenarioAdditionPathDisplay}`);
-      if (recordedOutcome.plannerHandoffRecord && recordedOutcome.plannerHandoffRecord.summary) {
-        verifierLines.push(
-          `Planner handoff summary: ${sanitizeInlineCode(recordedOutcome.plannerHandoffRecord.summary)}`,
-        );
-      }
-      if (recordedOutcome.scenarioAdditionMatched) {
-        verifierLines.push(
-          `Scenario addition target artifact: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionTargetArtifact)}`,
-        );
-        if (recordedOutcome.scenarioAdditionAddedScenarioOrOutline) {
-          verifierLines.push(
-            `Added scenario or outline: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionAddedScenarioOrOutline)}`,
-          );
-        }
-        if (recordedOutcome.scenarioAdditionSupportingEvidence) {
-          verifierLines.push(
-            `Scenario addition supporting evidence: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionSupportingEvidence)}`,
-          );
-        }
-        if (recordedOutcome.scenarioAdditionEscalationReason) {
-          verifierLines.push(
-            `Scenario addition escalation reason: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionEscalationReason)}`,
-          );
-        }
-        if (recordedOutcome.scenarioAdditionStopReason) {
-          verifierLines.push(
-            `Scenario addition stop reason: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionStopReason)}`,
-          );
-        }
-        if (recordedOutcome.scenarioAdditionBlockReason) {
-          verifierLines.push(
-            `Scenario addition block reason: ${sanitizeInlineCode(recordedOutcome.scenarioAdditionBlockReason)}`,
-          );
-        }
-      }
-      if (promotionResult) {
-        verifierLines.push(`Promotion report: ${promotionResult.promotionReportPathDisplay}`);
-        if (promotionResult.canonicalFeatureTargetDisplayPath) {
-          verifierLines.push(
-            `Canonical promotion target: ${sanitizeInlineCode(promotionResult.canonicalFeatureTargetDisplayPath)}`,
-          );
-        }
-        if (promotionResult.promotedScenarioOrOutline) {
-          verifierLines.push(
-            `Promoted scenario or outline: ${sanitizeInlineCode(promotionResult.promotedScenarioOrOutline)}`,
-          );
-        }
-        if (promotionResult.promotionStepFileDisplay) {
-          verifierLines.push(
-            `Canonical promotion step target: ${sanitizeInlineCode(promotionResult.promotionStepFileDisplay)}`,
-          );
-        }
-        verifierLines.push(`Promotion feature action: ${sanitizeInlineCode(promotionResult.featureAction)}`);
-        verifierLines.push(`Promotion step action: ${sanitizeInlineCode(promotionResult.stepAction)}`);
-        verifierLines.push(`Promotion summary: ${sanitizeInlineCode(promotionResult.summary)}`);
-      }
-    }
-
-    if (explorerItem) {
-      verifierLines.push('Explorer item: yes');
-      verifierLines.push(`Gap analysis: ${recordedOutcome.gapAnalysisPathDisplay}`);
-      verifierLines.push(...buildGuidedExplorationArtifactLines(guidedExploration));
-      verifierLines.push(...buildAutonomousExplorationArtifactLines(autonomousExploration));
-      if (recordedOutcome.gapAnalysisMatched) {
-        verifierLines.push(`Gap analysis scope: ${sanitizeInlineCode(recordedOutcome.gapAnalysisScope)}`);
-        verifierLines.push(`Gap candidate count: ${sanitizeInlineCode(recordedOutcome.gapAnalysisCandidateCount)}`);
-        if (recordedOutcome.gapAnalysisObservedGap) {
-          verifierLines.push(`Gap analysis observed gap: ${sanitizeInlineCode(recordedOutcome.gapAnalysisObservedGap)}`);
-        }
-        if (recordedOutcome.gapAnalysisCandidateScenario) {
-          verifierLines.push(
-            `Gap analysis candidate scenario: ${sanitizeInlineCode(recordedOutcome.gapAnalysisCandidateScenario)}`,
-          );
-        }
-        if (recordedOutcome.gapAnalysisAdditionTarget) {
-          verifierLines.push(
-            `Gap analysis addition target: ${sanitizeInlineCode(recordedOutcome.gapAnalysisAdditionTarget)}`,
-          );
-        }
-        if (recordedOutcome.gapAnalysisSupportingEvidence) {
-          verifierLines.push(
-            `Gap analysis supporting evidence: ${sanitizeInlineCode(recordedOutcome.gapAnalysisSupportingEvidence)}`,
-          );
-        }
-        if (recordedOutcome.gapAnalysisEscalationReason) {
-          verifierLines.push(
-            `Gap analysis escalation reason: ${sanitizeInlineCode(recordedOutcome.gapAnalysisEscalationReason)}`,
-          );
-        }
-        if (recordedOutcome.gapAnalysisStopReason) {
-          verifierLines.push(`Gap analysis stop reason: ${sanitizeInlineCode(recordedOutcome.gapAnalysisStopReason)}`);
-        }
-      }
-    }
-
-    if (selectedItem && selectedItem.result) {
-      verifierLines.push(`Recorded result: ${sanitizeInlineCode(selectedItem.result)}`);
-    }
-
-    if (selectedItem && selectedItem.fallbackReason) {
-      verifierLines.push(`Fallback reason: ${sanitizeInlineCode(selectedItem.fallbackReason)}`);
-    }
-
-    if (selectedItem && selectedItem.blockReason) {
-      verifierLines.push(`Block reason: ${sanitizeInlineCode(selectedItem.blockReason)}`);
-    }
-
-    if (recordedOutcome.healBlockReason) {
-      verifierLines.push(`Heal report block reason: ${sanitizeInlineCode(recordedOutcome.healBlockReason)}`);
-    }
-
-    verifierLines.push(`Summary: ${sanitizeInlineCode(verifierSummary)}`);
-    writeVerifierLog(artifactSet.runPaths.verifierLogPath, verifierStatus, verifierLines);
-
-    if (selectedItem) {
-      upsertProgressItemResult(artifactSet.runPaths.progressPath, {
-        itemId: selectedItem.id,
-        status: verifierStatus,
-        resultText: buildVerifierBackedProgressResultText(
-          verifierStatus,
-          verifierSummary,
-          advanceCommandDescription,
-          verifierLogDisplayPath,
-          runtimeLogDisplayPath,
-          [
-            ...(recordedOutcome.healingItem && recordedOutcome.healReportMatched
-              ? [`heal report ${recordedOutcome.healReportPathDisplay}`]
-              : []),
-            ...(scenarioAdditionItem && recordedOutcome.scenarioAdditionMatched
-              ? [`scenario addition ${recordedOutcome.scenarioAdditionPathDisplay}`]
-              : []),
-            ...(promotionResult && promotionResult.promotionReportPathDisplay
-              ? [`promotion report ${promotionResult.promotionReportPathDisplay}`]
-              : []),
-            ...(explorerItem && recordedOutcome.gapAnalysisMatched
-              ? [`gap analysis ${recordedOutcome.gapAnalysisPathDisplay}`]
-              : []),
-          ],
-        ),
-        fallbackReason: selectedItem.fallbackReason,
-        blockReason: verifierStatus === 'blocked' ? selectedItem.blockReason : undefined,
-      });
-    }
-
-    return {
-      status: verifierStatus,
-      summary: verifierSummary,
-      explorerItem,
-      scenarioAdditionItem,
-      runtimeLogPathDisplay: runtimeLogDisplayPath,
-      gapAnalysisPathDisplay: recordedOutcome.gapAnalysisPathDisplay,
-      promotionReportPathDisplay: promotionResult ? promotionResult.promotionReportPathDisplay : '',
-      scenarioAdditionPathDisplay: recordedOutcome.scenarioAdditionPathDisplay,
-      verifierLogPathDisplay: verifierLogDisplayPath,
-    };
-  } catch (error) {
-    const failureSummary = sanitizeInlineCode(error instanceof Error ? error.message : String(error));
-    if (pathExists(runPaths.logsDir)) {
-      writeVerifierLog(runPaths.verifierLogPath, 'fail', [
-        `Selected item: ${iterationResult.selectedItemId || 'missing'}`,
-        `Adapter: ${adapterName}`,
-        `Runtime log: ${runtimeLogDisplayPath}`,
-        `Summary: ${failureSummary}`,
-      ]);
-    }
-
-    return {
-      status: 'fail',
-      summary: failureSummary,
-      runtimeLogPathDisplay: runtimeLogDisplayPath,
-      gapAnalysisPathDisplay,
-      promotionReportPathDisplay,
-      scenarioAdditionPathDisplay,
-      verifierLogPathDisplay: verifierLogDisplayPath,
-    };
-  }
-}
-
-function advanceRun(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const adapterName = options.adapter || 'external';
-  const loadAdvanceRunSelectionFn = options.loadAdvanceRunSelectionFn || loadAdvanceRunSelection;
-  const iterateRunFn = options.iterateRunFn || iterateRun;
-  const reviewAdvanceRunExecutionFn = options.reviewAdvanceRunExecutionFn || reviewAdvanceRunExecutionResult;
-  const reviewAdvanceRunFn = options.reviewAdvanceRunFn || reviewAdvanceRunResult;
-  const iterateRunOptions = {
-    repoRoot,
-    templatesDir,
-    runId,
-    adapter: adapterName,
-    project: options.project,
-    headed: options.headed,
-    debug: options.debug,
-    baseUrl: options.baseUrl,
-    targetEnv: options.targetEnv,
-    trace: options.trace,
-    video: options.video,
-    screenshot: options.screenshot,
-  };
-
-  if (!runId) {
-    throw new Error('Missing required option --run-id.');
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'env')) {
-    iterateRunOptions.env = options.env;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(options, 'processRunner')) {
-    iterateRunOptions.processRunner = options.processRunner;
-  }
-
-  const selectedRunItem = loadAdvanceRunSelectionFn({
-    repoRoot,
-    templatesDir,
-    runId,
-  });
-  const iterationResult = iterateRunFn(iterateRunOptions);
-  const executionReviewResult = reviewAdvanceRunExecutionFn({
-    repoRoot,
-    templatesDir,
-    runId,
-    adapter: adapterName,
-    selectedItemId: selectedRunItem.selectedItemId,
-    healingItem: selectedRunItem.healingItem,
-    iterationResult,
-  });
-  const reviewResult = reviewAdvanceRunFn({
-    repoRoot,
-    templatesDir,
-    runId,
-    adapter: adapterName,
-    selectedItemId: selectedRunItem.selectedItemId,
-    healingItem: selectedRunItem.healingItem,
-    iterationResult,
-    executionReviewResult,
-  });
-
-  return {
-    ...iterationResult,
-    selectedItemId: executionReviewResult.selectedItemId || iterationResult.selectedItemId,
-    executionControls: iterationResult.executionControls,
-    healingItem: selectedRunItem.healingItem,
-    explorerItem: selectedRunItem.explorerItem || executionReviewResult.explorerItem || reviewResult.explorerItem,
-    scenarioAdditionItem:
-      selectedRunItem.scenarioAdditionItem
-      || executionReviewResult.scenarioAdditionItem
-      || reviewResult.scenarioAdditionItem,
-    status: reviewResult.status,
-    summary: reviewResult.summary,
-    delegatedStatus: executionReviewResult.status,
-    delegatedSummary: executionReviewResult.summary,
-    executorStatus: executionReviewResult.status,
-    executorSummary: executionReviewResult.summary,
-    verifierStatus: reviewResult.status,
-    verifierSummary: reviewResult.summary,
-    runtimeLogPathDisplay: reviewResult.runtimeLogPathDisplay,
-    verifierLogPathDisplay: reviewResult.verifierLogPathDisplay,
-    fallbackLogPathDisplay: executionReviewResult.fallbackLogPathDisplay,
-    gapAnalysisPathDisplay: executionReviewResult.gapAnalysisPathDisplay || reviewResult.gapAnalysisPathDisplay,
-    promotionReportPathDisplay: reviewResult.promotionReportPathDisplay,
-    scenarioAdditionPathDisplay:
-      executionReviewResult.scenarioAdditionPathDisplay || reviewResult.scenarioAdditionPathDisplay,
-    healReportPathDisplay: executionReviewResult.healReportPathDisplay,
-    iterationStatus: iterationResult.status,
-    iterationSummary: iterationResult.summary,
-  };
-}
-
-function loopRun(options) {
-  const repoRoot = options.repoRoot || process.cwd();
-  const templatesDir = options.templatesDir || resolveTemplatesDir(repoRoot);
-  const runId = options.runId;
-  const adapterName = options.adapter || 'external';
-  const maxIterations = parsePositiveIntegerOption(options.maxIterations, '--max-iterations');
-  const iterateRunFn = options.iterateRunFn || iterateRun;
-
-  if (!runId) {
-    throw new Error('Missing required option --run-id.');
-  }
-
-  assertRuntimeAdapterName(adapterName);
-
-  let completedIterations = 0;
-  let lastSelectedItemId = '';
-
-  const loadArtifactSet = () =>
-    loadRunArtifactSet({
-      repoRoot,
-      templatesDir,
-      runId,
-    });
-  let executionControlState = resolveExecutionControls({
-    ...options,
-    defaultProject: DEFAULT_EXECUTION_CONTROLS.project,
-  });
-  try {
-    const artifactSet = loadArtifactSet();
-    executionControlState = resolveExecutionControls({
-      ...options,
-      artifactSet,
-      defaultProject: DEFAULT_EXECUTION_CONTROLS.project,
-    });
-    persistExecutionControls(artifactSet, executionControlState);
-  } catch (error) {
-    if (!pathExists(resolveRunPaths(repoRoot, runId).runDir)) {
-      throw error;
-    }
-  }
-
-  const finalizeLoopRun = (status, stopReason) => {
-    const artifactSet = loadArtifactSet();
-    executionControlState = resolveExecutionControls({
-      artifactSet,
-      defaultProject: DEFAULT_EXECUTION_CONTROLS.project,
-    });
-    const runtimeLogDisplayPath = normalizeDisplayPath(
-      path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.runtimeLogPath),
-    );
-    const progressPathDisplay = normalizeDisplayPath(
-      path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.progressPath),
-    );
-    const loopReportPathDisplay = normalizeDisplayPath(
-      path.relative(artifactSet.runPaths.runDir, artifactSet.runPaths.loopReportPath),
-    );
-    const loopLines = [
-      `Run ID: ${runId}`,
-      `Adapter: ${adapterName}`,
-      `Configured max iterations: ${maxIterations}`,
-      `Completed iterations: ${completedIterations}`,
-      `Stop reason: ${stopReason}`,
-      `Final status: ${status}`,
-      `Last selected item: ${lastSelectedItemId || 'none'}`,
-      `Runtime log: ${runtimeLogDisplayPath}`,
-    ];
-    if (executionControlState.shouldPersist) {
-      loopLines.push(...buildExecutionControlLogLines(executionControlState.controls));
-    }
-
-    writeLoopReport(artifactSet.runPaths.loopReportPath, status, loopLines);
-
-    return {
-      runId,
-      runPaths: artifactSet.runPaths,
-      adapter: adapterName,
-      maxIterations,
-      completedIterations,
-      stopReason,
-      status,
-      finalStatus: status,
-      lastSelectedItemId,
-      executionControls: executionControlState.controls,
-      runtimeLogPath: artifactSet.runPaths.runtimeLogPath,
-      runtimeLogDisplayPath,
-      loopReportPath: artifactSet.runPaths.loopReportPath,
-      loopReportPathDisplay,
-      progressPathDisplay,
-    };
-  };
-
-  while (true) {
-    const artifactSet = loadArtifactSet();
-    const nextItem = findNextActionableProgressItem(artifactSet.progressContent);
-
-    if (!nextItem) {
-      return finalizeLoopRun('completed', 'no-actionable-items');
-    }
-
-    if (completedIterations >= maxIterations) {
-      return finalizeLoopRun('budget-exhausted', 'max-iterations-reached');
-    }
-
-    try {
-      const iterationResult = iterateRunFn({
-        repoRoot,
-        templatesDir,
-        runId,
-        adapter: adapterName,
-        env: options.env,
-        processRunner: options.processRunner,
-        project: options.project,
-        headed: options.headed,
-        debug: options.debug,
-        baseUrl: options.baseUrl,
-        targetEnv: options.targetEnv,
-        trace: options.trace,
-        video: options.video,
-        screenshot: options.screenshot,
-      });
-
-      completedIterations += 1;
-      if (iterationResult.selectedItemId) {
-        lastSelectedItemId = iterationResult.selectedItemId;
-      }
-
-      if (iterationResult.status === 'fail') {
-        return finalizeLoopRun('fail', 'fail');
-      }
-
-      if (iterationResult.status === 'blocked') {
-        return finalizeLoopRun('blocked', 'blocked');
-      }
-    } catch (error) {
-      if (isNoActionableProgressError(error, runId)) {
-        return finalizeLoopRun('completed', 'no-actionable-items');
-      }
-
-      throw error;
-    }
-  }
-}
 
 function verifyRun(options) {
   const repoRoot = options.repoRoot || process.cwd();
@@ -6573,6 +5227,103 @@ function createDoctorCheck(status, label, summary) {
   };
 }
 
+function getPlatformNpmCommand(platform = process.platform) {
+  return platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+function getPlatformCopilotCommand(platform = process.platform) {
+  return platform === 'win32' ? 'copilot.cmd' : 'copilot';
+}
+
+function readConfiguredCopilotCommand(repoRoot) {
+  const configPath = path.join(repoRoot, HARNESS_DIR_NAME, HARNESS_CONFIG_FILE);
+  if (!pathExists(configPath) || !fs.statSync(configPath).isFile()) {
+    return '';
+  }
+
+  try {
+    const parsedConfig = readJsonFile(configPath);
+    const command = parsedConfig && parsedConfig.copilot && parsedConfig.copilot.command;
+    return hasMeaningfulString(command) ? command.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function resolveDoctorCopilotCommand(repoRoot, platform = process.platform) {
+  return readConfiguredCopilotCommand(repoRoot) || getPlatformCopilotCommand(platform);
+}
+
+function firstCommandOutputLine(result) {
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+
+  return output ? sanitizeInlineCode(output) : '';
+}
+
+function appendDoctorFailureGuidance(label, summary) {
+  if (label !== 'copilot') {
+    return summary;
+  }
+
+  return `${summary}. Install Copilot CLI and ensure it is on PATH, or set copilot.command in .qa-harness/config.json`;
+}
+
+function runDoctorAvailabilityCheck(label, command, args, options) {
+  const commandRunner = options.commandRunner || runCommand;
+
+  try {
+    const result = commandRunner(command, args, options.repoRoot, { env: options.env });
+    if (result.status === 0) {
+      const detail = firstCommandOutputLine(result);
+      return createDoctorCheck(
+        'pass',
+        label,
+        detail ? `${command} available (${detail})` : `${command} available`,
+      );
+    }
+
+    const detail = firstCommandOutputLine(result);
+    return createDoctorCheck(
+      'fail',
+      label,
+      appendDoctorFailureGuidance(label, detail
+        ? `${command} ${args.join(' ')} exited ${result.status}: ${detail}`
+        : `${command} ${args.join(' ')} exited ${result.status}`),
+    );
+  } catch (error) {
+    return createDoctorCheck(
+      'fail',
+      label,
+      appendDoctorFailureGuidance(
+        label,
+        `${command} ${args.join(' ')} could not be run: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+  }
+}
+
+function createLocalCliPackageCheck(label, packageName, packageJsonPath, cliPath, cliDisplayPath) {
+  const missingParts = [];
+  const version = readPackageVersion(packageJsonPath);
+
+  if (!version) {
+    missingParts.push(`${packageName} package metadata`);
+  }
+
+  if (!pathExists(cliPath) || !fs.statSync(cliPath).isFile()) {
+    missingParts.push(`${packageName} CLI at ${cliDisplayPath}`);
+  }
+
+  if (missingParts.length > 0) {
+    return createDoctorCheck('fail', label, `missing ${missingParts.join(', ')}`);
+  }
+
+  return createDoctorCheck('pass', label, `${packageName} ${version} with local CLI ${cliDisplayPath}`);
+}
+
 function validateOptionalCommandArgs(rawValue, envVarName) {
   parseEnvStringArray(rawValue, envVarName);
 }
@@ -6580,37 +5331,28 @@ function validateOptionalCommandArgs(rawValue, envVarName) {
 function doctor(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
   const env = options.env || process.env;
-  const requestedProject = hasMeaningfulString(options.project)
-    ? sanitizeInlineCode(options.project)
-    : DEFAULT_EXECUTION_CONTROLS.project;
-  const requestedAdapter = hasMeaningfulString(options.adapter)
-    ? sanitizeInlineCode(options.adapter)
-    : 'external';
-  const requestedBaseUrl = hasMeaningfulString(options.baseUrl)
-    ? options.baseUrl
-    : hasMeaningfulString(env.PLAYWRIGHT_BASE_URL)
-      ? env.PLAYWRIGHT_BASE_URL
-      : '';
-  const requestedTargetEnv = hasMeaningfulString(options.targetEnv)
-    ? options.targetEnv
-    : hasMeaningfulString(env.QA_HARNESS_TARGET_ENV)
-      ? env.QA_HARNESS_TARGET_ENV
-      : '';
-  const requireBridge = options.requireBridge === true;
+  const platform = options.platform || process.platform;
+  const commandRunner = options.commandRunner || runCommand;
   const checks = [];
-
-  assertRuntimeAdapterName(requestedAdapter);
 
   checks.push(createDoctorCheck('pass', 'node', `detected ${process.version}`));
 
-  const npmVersion = readPackageVersion(resolveNpmPackageJsonPath(env));
-  if (npmVersion) {
-    checks.push(createDoctorCheck('pass', 'npm', `detected ${npmVersion}`));
-  } else {
-    checks.push(createDoctorCheck('fail', 'npm', 'npm package metadata could not be resolved from the current Node installation'));
-  }
+  checks.push(
+    runDoctorAvailabilityCheck('npm', getPlatformNpmCommand(platform), ['--version'], {
+      repoRoot,
+      env,
+      commandRunner,
+    }),
+  );
 
-  const packageJsonPath = path.join(repoRoot, 'package.json');
+  checks.push(
+    runDoctorAvailabilityCheck('git', 'git', ['--version'], {
+      repoRoot,
+      env,
+      commandRunner,
+    }),
+  );
+
   const featuresDir = path.join(repoRoot, 'Features');
   const stepsDir = path.join(featuresDir, 'steps');
   const featureFiles = collectFilesRecursively(featuresDir, (entryPath) => entryPath.toLowerCase().endsWith('.feature'));
@@ -6618,23 +5360,20 @@ function doctor(options = {}) {
   const playwrightConfigPath = resolvePlaywrightConfigPath(repoRoot);
   const missingLayoutParts = [];
 
-  if (!pathExists(packageJsonPath)) {
-    missingLayoutParts.push('package.json');
-  }
   if (!playwrightConfigPath) {
-    missingLayoutParts.push('playwright.config.*');
+    missingLayoutParts.push('playwright.config.* config file');
   }
   if (!pathExists(featuresDir) || !fs.statSync(featuresDir).isDirectory()) {
-    missingLayoutParts.push('Features/');
+    missingLayoutParts.push('Features/ directory');
   }
   if (!pathExists(stepsDir) || !fs.statSync(stepsDir).isDirectory()) {
-    missingLayoutParts.push('Features/steps/');
+    missingLayoutParts.push('Features/steps/ directory');
   }
   if (featureFiles.length === 0) {
-    missingLayoutParts.push('Features/**/*.feature');
+    missingLayoutParts.push('Features/**/*.feature feature files');
   }
   if (stepFiles.length === 0) {
-    missingLayoutParts.push('Features/steps/**/*.ts');
+    missingLayoutParts.push('Features/steps/**/*.ts step definitions');
   }
 
   if (missingLayoutParts.length > 0) {
@@ -6651,107 +5390,29 @@ function doctor(options = {}) {
 
   const playwrightCliPath = path.join(repoRoot, 'node_modules', 'playwright', 'cli.js');
   const playwrightBddCliPath = path.join(repoRoot, 'node_modules', 'playwright-bdd', 'dist', 'cli', 'index.js');
-  const playwrightVersion = readPackageVersion(path.join(repoRoot, 'node_modules', 'playwright', 'package.json'));
-  const playwrightBddVersion = readPackageVersion(path.join(repoRoot, 'node_modules', 'playwright-bdd', 'package.json'));
-  if (!pathExists(playwrightCliPath)) {
-    checks.push(createDoctorCheck('fail', 'playwright', 'local Playwright CLI not found under node_modules/playwright/cli.js'));
-  } else if (!pathExists(playwrightBddCliPath)) {
-    checks.push(createDoctorCheck('fail', 'playwright', 'local playwright-bdd CLI not found under node_modules/playwright-bdd/dist/cli/index.js'));
-  } else if (!playwrightVersion) {
-    checks.push(createDoctorCheck('fail', 'playwright', 'local Playwright package metadata could not be read'));
-  } else if (!playwrightBddVersion) {
-    checks.push(createDoctorCheck('fail', 'playwright', 'local playwright-bdd package metadata could not be read'));
-  } else {
-    checks.push(
-      createDoctorCheck(
-        'pass',
-        'playwright',
-        `playwright ${playwrightVersion} and playwright-bdd ${playwrightBddVersion} detected locally`,
-      ),
-    );
-  }
+  checks.push(createLocalCliPackageCheck(
+    'playwright',
+    'Playwright',
+    path.join(repoRoot, 'node_modules', 'playwright', 'package.json'),
+    playwrightCliPath,
+    'node_modules/playwright/cli.js',
+  ));
 
-  if (!pathExists(playwrightCliPath)) {
-    checks.push(createDoctorCheck('fail', 'browsers', 'cannot check browser installation without a local Playwright CLI'));
-  } else {
-    const browserDetection = detectInstalledPlaywrightBrowsers(repoRoot, env);
-    if (browserDetection.installedBrowsers.size === 0) {
-      const rootSummary = browserDetection.inspectedRoots.length > 0
-        ? ` under ${browserDetection.inspectedRoots.map((rootPath) => normalizeDisplayPath(rootPath)).join(', ')}`
-        : '';
-      checks.push(createDoctorCheck('fail', 'browsers', `no installed Playwright browsers were found${rootSummary}`));
-    } else if (
-      ['chromium', 'firefox', 'webkit'].includes(requestedProject)
-      && !browserDetection.installedBrowsers.has(requestedProject)
-    ) {
-      checks.push(
-        createDoctorCheck(
-          'fail',
-          'browsers',
-          `${requestedProject} is not installed; detected ${Array.from(browserDetection.installedBrowsers).sort().join(', ')}`,
-        ),
-      );
-    } else {
-      const browserSummary = ['chromium', 'firefox', 'webkit']
-        .filter((browserName) => browserDetection.installedBrowsers.has(browserName))
-        .join(', ');
-      const projectSegment = ['chromium', 'firefox', 'webkit'].includes(requestedProject)
-        ? `; ${requestedProject} is ready`
-        : `; unable to map custom project ${requestedProject} to a browser install check`;
-      checks.push(createDoctorCheck('pass', 'browsers', `${browserSummary}${projectSegment}`));
-    }
-  }
+  checks.push(createLocalCliPackageCheck(
+    'playwright-bdd',
+    'playwright-bdd',
+    path.join(repoRoot, 'node_modules', 'playwright-bdd', 'package.json'),
+    playwrightBddCliPath,
+    'node_modules/playwright-bdd/dist/cli/index.js',
+  ));
 
-  if (requestedAdapter === 'external') {
-    const externalCommand = typeof env.QA_HARNESS_EXTERNAL_RUNTIME_CMD === 'string'
-      ? env.QA_HARNESS_EXTERNAL_RUNTIME_CMD.trim()
-      : '';
-    try {
-      validateOptionalCommandArgs(env.QA_HARNESS_EXTERNAL_RUNTIME_ARGS, 'QA_HARNESS_EXTERNAL_RUNTIME_ARGS');
-      if (externalCommand) {
-        checks.push(createDoctorCheck('pass', 'runtime', `custom external runtime configured via ${externalCommand}`));
-      } else {
-        checks.push(createDoctorCheck('pass', 'runtime', 'bundled external worker will be used'));
-      }
-    } catch (error) {
-      checks.push(createDoctorCheck('fail', 'runtime', error instanceof Error ? error.message : String(error)));
-    }
-  } else {
-    checks.push(createDoctorCheck('pass', 'runtime', 'mock adapter selected for deterministic local testing'));
-  }
-
-  const bridgeCommand = typeof env.QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD === 'string'
-    ? env.QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD.trim()
-    : '';
-  const bridgeArgsConfigured =
-    typeof env.QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS === 'string' && env.QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS.trim();
-  if (requireBridge || bridgeCommand || bridgeArgsConfigured) {
-    if (!bridgeCommand) {
-      checks.push(createDoctorCheck('fail', 'bridge', 'QA_HARNESS_PLAYWRIGHT_BRIDGE_CMD is required when bridge validation is requested'));
-    } else {
-      try {
-        validateOptionalCommandArgs(env.QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS, 'QA_HARNESS_PLAYWRIGHT_BRIDGE_ARGS');
-        checks.push(createDoctorCheck('pass', 'bridge', `Playwright bridge configured via ${bridgeCommand}`));
-      } catch (error) {
-        checks.push(createDoctorCheck('fail', 'bridge', error instanceof Error ? error.message : String(error)));
-      }
-    }
-  } else {
-    checks.push(createDoctorCheck('warn', 'bridge', 'Playwright test/debug bridge not configured; CLI-only execution remains available'));
-  }
-
-  if (requestedBaseUrl) {
-    try {
-      const parsedBaseUrl = new URL(requestedBaseUrl);
-      checks.push(createDoctorCheck('pass', 'inputs', `base URL ${parsedBaseUrl.toString()}${requestedTargetEnv ? `; target environment ${requestedTargetEnv}` : ''}`));
-    } catch {
-      checks.push(createDoctorCheck('fail', 'inputs', `base URL must be an absolute URL; received ${sanitizeInlineCode(requestedBaseUrl)}`));
-    }
-  } else if (requestedTargetEnv) {
-    checks.push(createDoctorCheck('pass', 'inputs', `target environment ${sanitizeInlineCode(requestedTargetEnv)}; using target project baseURL defaults`));
-  } else {
-    checks.push(createDoctorCheck('pass', 'inputs', 'using target project Playwright config defaults'));
-  }
+  checks.push(
+    runDoctorAvailabilityCheck('copilot', resolveDoctorCopilotCommand(repoRoot, platform), ['--help'], {
+      repoRoot,
+      env,
+      commandRunner,
+    }),
+  );
 
   const failureCount = checks.filter((check) => check.status === 'fail').length;
   const warningCount = checks.filter((check) => check.status === 'warn').length;
@@ -6786,24 +5447,14 @@ function formatDoctorOutput(result) {
 }
 
 function usage() {
-  const executionControlsUsage =
-    '[--project <project>] [--headed <true|false>] [--debug <true|false>] ' +
-    '[--base-url <url>] [--target-env <name>] [--trace <mode>] [--video <mode>] [--screenshot <mode>]';
-  const bridgeUsage = '[--adapter <name>] [--require-bridge <true|false>] [--project <project>] [--base-url <url>] [--target-env <name>]';
   const commandPrefix = getHarnessCommandPrefix();
   return [
     'Usage:',
-    `  ${commandPrefix} create-run --intent <intent> --source-type feature --source-ref <feature-path> [--mode <mode>] [--scope <scope>] [--constraint "..."]`,
-    `  ${commandPrefix} prepare-run --intent <intent> --source-type feature --source-ref <feature-path> [--mode <mode>] [--scope <scope>] [--constraint "..."]`,
-    `  ${commandPrefix} prepare-run --request "<operator request>" [--constraint "..."]`,
-    `  ${commandPrefix} prepare-run --run-id <run-id> [--constraint "..."]`,
-    `  ${commandPrefix} doctor ${bridgeUsage}`,
-    `  ${commandPrefix} preflight ${bridgeUsage}`,
-    `  ${commandPrefix} verify-run --run-id <run-id> ${executionControlsUsage}`,
-    `  ${commandPrefix} execute-run --run-id <run-id> ${executionControlsUsage}`,
-    `  ${commandPrefix} advance-run --run-id <run-id> [--adapter <name>] ${executionControlsUsage}`,
-    `  ${commandPrefix} iterate-run --run-id <run-id> [--adapter <name>] ${executionControlsUsage}`,
-    `  ${commandPrefix} loop-run --run-id <run-id> --max-iterations <n> [--adapter <name>] ${executionControlsUsage}`,
+    `  ${commandPrefix} doctor`,
+    `  ${commandPrefix} prepare --from <feature-path>`,
+    `  ${commandPrefix} run --max-iterations <positive-integer>`,
+    `  ${commandPrefix} status`,
+    `  ${commandPrefix} verify`,
   ].join('\n');
 }
 
@@ -6934,81 +5585,6 @@ function formatPrepareRunFailureOperatorOutput(repoRoot, failure, error) {
   );
 }
 
-function formatBoundedIterationOperatorOutput(action, result) {
-  const selectedItemSegment = result.selectedItemId ? ` item ${result.selectedItemId}` : '';
-  const primaryArtifactDisplay =
-    result.healingItem && result.healReportPathDisplay
-      ? result.healReportPathDisplay
-      : result.scenarioAdditionItem && result.scenarioAdditionPathDisplay
-        ? result.scenarioAdditionPathDisplay
-      : result.explorerItem && result.gapAnalysisPathDisplay
-        ? result.gapAnalysisPathDisplay
-        : result.runtimeLogPathDisplay || '';
-
-  return (
-    `${action} run ${result.runId}${selectedItemSegment} with ${result.adapter}: ` +
-    `${result.status} - ${result.summary}` +
-    `${formatArtifactReferenceSegment([primaryArtifactDisplay])}\n`
-  );
-}
-
-function formatAdvanceRunOperatorOutput(result) {
-  const selectedItemSegment = result.selectedItemId ? ` item ${result.selectedItemId}` : '';
-  const delegatedStatus = result.delegatedStatus || result.executorStatus || result.iterationStatus || result.status;
-  const verifierStatus = result.verifierStatus || result.status;
-  const delegatedSummary = sanitizeInlineCode(
-    result.delegatedSummary || result.executorSummary || result.iterationSummary || result.summary || 'summary unavailable.',
-  );
-  const verifierSummary = sanitizeInlineCode(result.verifierSummary || result.summary || 'summary unavailable.');
-  const followUpArtifactRefs = [result.verifierLogPathDisplay || 'logs/verifier.log'];
-
-  if (result.healingItem && result.healReportPathDisplay) {
-    followUpArtifactRefs.push(result.healReportPathDisplay);
-  } else if (result.scenarioAdditionItem) {
-    if (result.scenarioAdditionPathDisplay) {
-      followUpArtifactRefs.push(result.scenarioAdditionPathDisplay);
-    }
-    if (result.promotionReportPathDisplay) {
-      followUpArtifactRefs.push(result.promotionReportPathDisplay);
-    }
-  } else if (result.explorerItem && result.gapAnalysisPathDisplay) {
-    followUpArtifactRefs.push(result.gapAnalysisPathDisplay);
-  } else {
-    followUpArtifactRefs.push(result.runtimeLogPathDisplay || 'logs/runtime.log');
-  }
-
-  if (
-    (delegatedSummary.includes('fallback') || verifierSummary.includes('fallback'))
-    && result.fallbackLogPathDisplay
-  ) {
-    followUpArtifactRefs.push(result.fallbackLogPathDisplay);
-  }
-
-  return (
-    `Advanced run ${result.runId}${selectedItemSegment} with ${result.adapter}: ${result.status}; ` +
-    `delegated=${delegatedStatus}: ${delegatedSummary}; ` +
-    `verifier=${verifierStatus}: ${verifierSummary}` +
-    `${formatArtifactReferenceSegment(followUpArtifactRefs)}\n`
-  );
-}
-
-function formatLoopRunOperatorOutput(result) {
-  const lastItemSegment = result.lastSelectedItemId ? `; last-item=${result.lastSelectedItemId}` : '';
-  const artifactRefs = [result.loopReportPathDisplay || 'outputs/loop-report.md'];
-
-  if (result.status === 'budget-exhausted' && result.progressPathDisplay) {
-    artifactRefs.push(result.progressPathDisplay);
-  } else if ((result.status === 'fail' || result.status === 'blocked') && result.runtimeLogDisplayPath) {
-    artifactRefs.push(result.runtimeLogDisplayPath);
-  }
-
-  return (
-    `Looped run ${result.runId} with ${result.adapter}: ${result.status} ` +
-    `after ${result.completedIterations}/${result.maxIterations} iterations; stop=${result.stopReason}` +
-    `${lastItemSegment}${formatArtifactReferenceSegment(artifactRefs)}\n`
-  );
-}
-
 function parseCliArgs(argv) {
   if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
     return { help: true };
@@ -7039,6 +5615,87 @@ function parseCliArgs(argv) {
   }
 
   return { command, options };
+}
+
+function commandNotImplemented(command) {
+  throw new Error(`Command "${command}" is not implemented yet.`);
+}
+
+function writeLeanCommandResult(command, result, stdout, stderr) {
+  const status = result && typeof result.status === 'string' ? result.status : '';
+  const exitCode = result && Number.isInteger(result.exitCode)
+    ? result.exitCode
+    : ['blocked', 'fail', 'failed', 'stalled'].includes(status)
+      ? 1
+      : 0;
+  const output =
+    result && typeof result.output === 'string'
+      ? result.output
+      : result && typeof result.summary === 'string'
+        ? `${result.summary}\n`
+        : `${command} completed.\n`;
+  const normalizedOutput = output.endsWith('\n') ? output : `${output}\n`;
+
+  if (exitCode === 0) {
+    stdout.write(normalizedOutput);
+  } else {
+    stderr.write(normalizedOutput);
+  }
+
+  return exitCode;
+}
+
+function findUnexpectedLeanCliOptions(cliOptions, allowedKeys) {
+  const allowed = new Set(allowedKeys);
+  const unexpected = [];
+
+  for (const [key, value] of Object.entries(cliOptions)) {
+    if (key === 'constraint') {
+      if (Array.isArray(value) && value.length > 0 && !allowed.has(key)) {
+        unexpected.push(key);
+      }
+      continue;
+    }
+
+    if (!allowed.has(key)) {
+      unexpected.push(key);
+    }
+  }
+
+  return unexpected;
+}
+
+function assertLeanCliOptions(command, cliOptions, allowedKeys) {
+  const unexpected = findUnexpectedLeanCliOptions(cliOptions, allowedKeys);
+  if (unexpected.length > 0) {
+    throw new Error(`${command} does not accept --${unexpected[0]}.\n\n${usage()}`);
+  }
+}
+
+function buildLeanPrepareCliOptions(cliOptions) {
+  assertLeanCliOptions('prepare', cliOptions, ['from']);
+
+  if (!hasMeaningfulString(cliOptions.from)) {
+    throw new Error(`Missing required option --from for prepare.\n\n${usage()}`);
+  }
+
+  return {
+    from: cliOptions.from,
+  };
+}
+
+function buildLeanRunCliOptions(cliOptions) {
+  assertLeanCliOptions('run', cliOptions, ['max-iterations']);
+
+  return {
+    maxIterations: parsePositiveIntegerOption(cliOptions['max-iterations'], '--max-iterations'),
+  };
+}
+
+function buildNoOptionLeanCliOptions(command, cliOptions) {
+  assertLeanCliOptions(command, cliOptions, []);
+
+  return {};
 }
 
 function buildExecutionControlCliOptions(cliOptions) {
@@ -7135,10 +5792,6 @@ function buildDoctorCliOptions(cliOptions) {
     doctorOptions.project = cliOptions.project;
   }
 
-  if (hasMeaningfulString(cliOptions.adapter)) {
-    doctorOptions.adapter = cliOptions.adapter;
-  }
-
   if (hasMeaningfulString(cliOptions['base-url'])) {
     doctorOptions.baseUrl = cliOptions['base-url'];
   }
@@ -7158,14 +5811,11 @@ function runCli(argv, options = {}) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
   const repoRoot = options.repoRoot || process.cwd();
-  const prepareRunFn = options.prepareRunFn || prepareRun;
-  const createRunFn = options.createRunFn || createRun;
   const doctorFn = options.doctorFn || doctor;
-  const verifyRunFn = options.verifyRunFn || verifyRun;
-  const executeRunFn = options.executeRunFn || executeRun;
-  const advanceRunFn = options.advanceRunFn || advanceRun;
-  const iterateRunFn = options.iterateRunFn || iterateRun;
-  const loopRunFn = options.loopRunFn || loopRun;
+  const prepareFn = options.prepareFn || prepare;
+  const runFn = options.runFn || run;
+  const statusFn = options.statusFn || status;
+  const verifyFn = options.verifyFn || verify;
 
   try {
     const parsed = parseCliArgs(argv);
@@ -7174,166 +5824,83 @@ function runCli(argv, options = {}) {
       return 0;
     }
 
-    if (parsed.command === 'create-run') {
-      const result = createRunFn({
-        repoRoot,
-        request: {
-          intent: parsed.options.intent,
-          sourceType: parsed.options['source-type'],
-          sourceRef: parsed.options['source-ref'],
-          mode: parsed.options.mode,
-          scope: parsed.options.scope,
-          constraints: parsed.options.constraint,
-        },
-      });
-
-      stdout.write(
-        `Created run ${result.runId} at ${normalizeDisplayPath(path.relative(repoRoot, result.runPaths.runDir))}\n`,
-      );
-      return 0;
-    }
-
-    if (parsed.command === 'prepare-run') {
-      try {
-        const result = prepareRunFn({
+    const harnessPaths = resolveHarnessPaths(repoRoot);
+    const commandHandlers = {
+      doctor: () => {
+        const result = doctorFn({
           repoRoot,
-          ...buildPrepareRunCliOptions(parsed.options),
+          env: options.env || process.env,
+          commandRunner: options.commandRunner,
+          platform: options.platform,
+          ...buildDoctorCliOptions(parsed.options),
         });
-        stdout.write(formatPrepareRunSuccessOperatorOutput(repoRoot, result));
-        return 0;
-      } catch (error) {
-        if (error && typeof error === 'object' && error.prepareRunFailure) {
-          stderr.write(formatPrepareRunFailureOperatorOutput(repoRoot, error.prepareRunFailure, error));
-          return 1;
+        const output = formatDoctorOutput(result);
+
+        if (result.status === 'pass') {
+          stdout.write(output);
+          return 0;
         }
 
-        throw error;
-      }
+        stderr.write(output);
+        return 1;
+      },
+      prepare: () =>
+        writeLeanCommandResult('prepare', prepareFn({
+          repoRoot,
+          harnessPaths,
+          ...buildLeanPrepareCliOptions(parsed.options),
+        }), stdout, stderr),
+      run: () => {
+        const runOptions = {
+          repoRoot,
+          harnessPaths,
+          ...buildLeanRunCliOptions(parsed.options),
+        };
+        if (Object.prototype.hasOwnProperty.call(options, 'commandRunner')) {
+          runOptions.commandRunner = options.commandRunner;
+        }
+        if (Object.prototype.hasOwnProperty.call(options, 'env')) {
+          runOptions.env = options.env;
+        }
+        if (Object.prototype.hasOwnProperty.call(options, 'platform')) {
+          runOptions.platform = options.platform;
+        }
+        if (Object.prototype.hasOwnProperty.call(options, 'now')) {
+          runOptions.now = options.now;
+        }
+        if (Object.prototype.hasOwnProperty.call(options, 'verifyFn')) {
+          runOptions.verifyFn = options.verifyFn;
+        }
+        return writeLeanCommandResult('run', runFn(runOptions), stdout, stderr);
+      },
+      status: () =>
+        writeLeanCommandResult('status', statusFn({
+          repoRoot,
+          harnessPaths,
+          ...buildNoOptionLeanCliOptions('status', parsed.options),
+        }), stdout, stderr),
+      verify: () => {
+        const verifyOptions = {
+          repoRoot,
+          harnessPaths,
+          ...buildNoOptionLeanCliOptions('verify', parsed.options),
+        };
+        if (Object.prototype.hasOwnProperty.call(options, 'commandRunner')) {
+          verifyOptions.commandRunner = options.commandRunner;
+        }
+        if (Object.prototype.hasOwnProperty.call(options, 'env')) {
+          verifyOptions.env = options.env;
+        }
+        return writeLeanCommandResult('verify', verifyFn(verifyOptions), stdout, stderr);
+      },
+    };
+
+    const commandHandler = commandHandlers[parsed.command];
+    if (!commandHandler) {
+      throw new Error(`Unknown command "${parsed.command}".\n\n${usage()}`);
     }
 
-    if (parsed.command === 'doctor' || parsed.command === 'preflight') {
-      const result = doctorFn({
-        repoRoot,
-        env: options.env || process.env,
-        ...buildDoctorCliOptions(parsed.options),
-      });
-      const output = formatDoctorOutput(result);
-
-      if (result.status === 'pass') {
-        stdout.write(output);
-        return 0;
-      }
-
-      stderr.write(output);
-      return 1;
-    }
-
-    if (parsed.command === 'verify-run') {
-      if (!parsed.options['run-id']) {
-        throw new Error(`Missing value for option --run-id.\n\n${usage()}`);
-      }
-
-      const result = verifyRunFn({
-        repoRoot,
-        runId: parsed.options['run-id'],
-        ...buildExecutionControlCliOptions(parsed.options),
-      });
-
-      stdout.write(
-        `Verified run ${result.runId}: ${formatVerifyRunSummary(result)}.\n`,
-      );
-      return 0;
-    }
-
-    if (parsed.command === 'execute-run') {
-      if (!parsed.options['run-id']) {
-        throw new Error(`Missing value for option --run-id.\n\n${usage()}`);
-      }
-
-      const result = executeRunFn({
-        repoRoot,
-        runId: parsed.options['run-id'],
-        ...buildExecutionControlCliOptions(parsed.options),
-      });
-
-      stdout.write(
-        `Executed run ${result.runId} on ${result.project}: ${result.summary}\n`,
-      );
-      return 0;
-    }
-
-    if (parsed.command === 'advance-run') {
-      if (!parsed.options['run-id']) {
-        throw new Error(`Missing value for option --run-id.\n\n${usage()}`);
-      }
-
-      const result = advanceRunFn({
-        repoRoot,
-        runId: parsed.options['run-id'],
-        adapter: parsed.options.adapter || 'external',
-        ...buildExecutionControlCliOptions(parsed.options),
-      });
-      const output = formatAdvanceRunOperatorOutput(result);
-
-      if (result.status === 'pass') {
-        stdout.write(output);
-        return 0;
-      }
-
-      stderr.write(output);
-      return 1;
-    }
-
-    if (parsed.command === 'iterate-run') {
-      if (!parsed.options['run-id']) {
-        throw new Error(`Missing value for option --run-id.\n\n${usage()}`);
-      }
-
-      const result = iterateRunFn({
-        repoRoot,
-        runId: parsed.options['run-id'],
-        adapter: parsed.options.adapter || 'external',
-        ...buildExecutionControlCliOptions(parsed.options),
-      });
-      const output = formatBoundedIterationOperatorOutput('Iterated', result);
-
-      if (result.status === 'pass') {
-        stdout.write(output);
-        return 0;
-      }
-
-      stderr.write(output);
-      return 1;
-    }
-
-    if (parsed.command === 'loop-run') {
-      if (!parsed.options['run-id']) {
-        throw new Error(`Missing value for option --run-id.\n\n${usage()}`);
-      }
-
-      if (!parsed.options['max-iterations']) {
-        throw new Error(`Missing value for option --max-iterations.\n\n${usage()}`);
-      }
-
-      const result = loopRunFn({
-        repoRoot,
-        runId: parsed.options['run-id'],
-        maxIterations: parsePositiveIntegerOption(parsed.options['max-iterations'], '--max-iterations'),
-        adapter: parsed.options.adapter || 'external',
-        ...buildExecutionControlCliOptions(parsed.options),
-      });
-      const output = formatLoopRunOperatorOutput(result);
-
-      if (result.status === 'completed' || result.status === 'budget-exhausted') {
-        stdout.write(output);
-        return 0;
-      }
-
-      stderr.write(output);
-      return 1;
-    }
-
-    throw new Error(`Unknown command "${parsed.command}".\n\n${usage()}`);
+    return commandHandler();
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
@@ -7341,28 +5908,30 @@ function runCli(argv, options = {}) {
 }
 
 module.exports = {
-  advanceRun,
   createRun,
   createRunId,
   doctor,
-  executeRun,
   extractTemplatePlaceholders,
   findNextActionableProgressItem,
   findGeneratedSpecsForRun,
   formatDoctorOutput,
   getTemplatePlaceholders,
-  iterateRun,
-  loopRun,
   parseProgressItems,
   parseExportedStepCount,
   parseListedTestCount,
   parseCliArgs,
   clarifyPrepareRunRequest,
   planPreparedRunArtifacts,
+  prepare,
+  run,
+  verify,
   prepareRun,
+  resolveHarnessPaths,
+  resolveGeneratedHarnessPaths,
   resolveProjectCliInvocation,
   resolveRunPaths,
   runCli,
+  status,
   usage,
   validateRequestEnvelope,
   verifyRun,

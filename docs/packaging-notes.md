@@ -5,10 +5,6 @@ This repository packages the QA harness as a standalone npm CLI with a narrow, e
 ## Included components
 
 - `scripts/qa-harness.js`
-- `scripts/qa-orchestrator.js`
-- `scripts/qa-runtime-external-worker.js`
-- `scripts/qa-runtime-mock-adapter.js`
-- `examples/qa-runtime-demo-agent.js`
 - `templates/qa-run/*`
 - `docs/copilot-first-qa-ralph-harness.md`
 - `tests/harness/qa-harness.test.js`
@@ -17,7 +13,7 @@ This repository packages the QA harness as a standalone npm CLI with a narrow, e
 
 - Package-owned templates resolve from this package instead of from the target project.
 - The operator-facing CLI name is `ralph-qa-harness`.
-- `doctor` and `preflight` validate the current supported target-project contract.
+- `doctor` validates the current supported target-project contract.
 - Public docs focus on how to use the package from a compatible target project root.
 
 ## Intentionally out of scope
