@@ -4,7 +4,7 @@
 
 `ralph-qa-harness` owns the product Ralph loop internally. Product runs must not delegate to `ralph-codex`; `ralph-codex` remains a separate builder/supervisor tool for developing this package, not the runtime engine for the QA harness product.
 
-The default `ralph-qa-harness run` budget is `10` iterations. Operators may override the budget with `ralph-qa-harness run --max-iterations <n>`, where `<n>` is a positive integer.
+The default `ralph-qa-harness run` budget is `40` iterations. Operators may override the budget with `ralph-qa-harness run --max-iterations <n>`, where `<n>` is a positive integer.
 
 Every loop iteration starts a fresh worker context for the selected agent. Agents must not rely on previous chat/session context. Durable memory comes only from `.qa-harness/` artifacts and the current worker prompt, which preserves the original Ralph loop idea: supervisor-owned loop, fresh worker per iteration, file-backed memory, deterministic validation, and evidence before completion.
 
@@ -29,7 +29,7 @@ The loop needs explicit role separation. Planning, execution, and verification c
 
 Requirements intake is currently too weak for coverage requests. The harness must not generate speculative coverage from an underspecified prompt. For coverage work, the orchestrator must ask for a Jira ticket link/text or pasted requirements and acceptance criteria before allowing planner or executor work to continue.
 
-Default operator ergonomics should be simple. The normal command should be `ralph-qa-harness run`; operators should not have to provide `--max-iterations` every time. The default budget is `10`.
+Default operator ergonomics should be simple. The normal command should be `ralph-qa-harness run`; operators should not have to provide `--max-iterations` every time. The default budget is `40`.
 
 ## Target Flow
 
@@ -44,7 +44,7 @@ qa-planner
   -> creates/refines PRD.md, progress.md, PROMPT.md
   -> creates bounded tasks
 qa-orchestrator
-  -> starts iteration loop, default max iterations 10
+  -> starts iteration loop, default max iterations 40
   -> selects next role/task from progress.md
 qa-executor
   -> performs discovery and implementation for one bounded task
@@ -285,11 +285,11 @@ RALPH_NEXT: <next recommended action, or none>
 
 ## CLI Design
 
-`ralph-qa-harness run` defaults to `10` iterations.
+`ralph-qa-harness run` defaults to `40` iterations.
 
 Behavior:
 
-- `ralph-qa-harness run` uses max iterations `10`.
+- `ralph-qa-harness run` uses max iterations `40`.
 - `ralph-qa-harness run --max-iterations 3` uses max iterations `3`.
 - `ralph-qa-harness run --max-iterations 0` fails clearly.
 - `ralph-qa-harness run --max-iterations -1` fails clearly.
@@ -481,7 +481,7 @@ The verifier must reject coverage when:
 
 ## Development Checklist
 
-- Add optional `--max-iterations` defaulting to `10`.
+- Add optional `--max-iterations` defaulting to `40`.
 - Add config default for loop max iterations.
 - Add static agent templates and package tests proving they exist.
 - Add role prompt builder that injects selected agent files.
@@ -541,7 +541,7 @@ Implementation order:
 
 Detailed expected test coverage:
 
-- `run` with no `--max-iterations` dispatches at most `10` iterations.
+- `run` with no `--max-iterations` dispatches at most `40` iterations.
 - `run --max-iterations 3` dispatches at most `3` iterations.
 - `run --max-iterations 0` exits nonzero with a clear message.
 - `run --max-iterations -1` exits nonzero with a clear message.
@@ -567,7 +567,7 @@ This design is complete when:
 
 - It states exactly four agents.
 - It states orchestrator owns the loop.
-- It states default max iterations is `10`.
+- It states default max iterations is `40`.
 - It states every iteration uses a fresh worker context.
 - It states durable memory is file-backed through `.qa-harness/`.
 - It states Playwright CLI first, MCP fallback second.

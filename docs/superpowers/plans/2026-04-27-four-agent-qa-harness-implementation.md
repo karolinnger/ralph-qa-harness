@@ -4,7 +4,7 @@
 
 **Goal:** Upgrade `ralph-qa-harness` so its product runtime owns a four-agent, file-backed Ralph loop for QA coverage work.
 
-**Architecture:** Keep `ralph-codex` strictly as the builder supervisor for this repository. The product package remains rooted at `C:\Users\kolos\IdeaProjects\Colossus`; `ralph-qa-harness` must own its internal product loop, launch a fresh product worker process or isolated execution for every product iteration, and store durable product memory only under `.qa-harness/`. The product loop has exactly four roles: `qa-orchestrator`, `qa-planner`, `qa-executor`, and `qa-verifier`.
+**Architecture:** Keep `ralph-codex` strictly as the builder supervisor for this repository. The product package remains rooted at the `ralph-qa-harness` checkout; `ralph-qa-harness` must own its internal product loop, launch a fresh product worker process or isolated execution for every product iteration, and store durable product memory only under `.qa-harness/`. The product loop has exactly four roles: `qa-orchestrator`, `qa-planner`, `qa-executor`, and `qa-verifier`.
 
 **Tech Stack:** Node.js CommonJS CLI, `node:test`, Playwright, `playwright-bdd`, static Markdown templates, durable JSON and Markdown artifacts under `.qa-harness/`.
 
@@ -12,7 +12,7 @@
 
 ## Non-Negotiable Instructions
 
-Run all commands from `C:\Users\kolos\IdeaProjects\Colossus`.
+Run all commands from the `ralph-qa-harness` checkout root.
 
 Do not stage, commit, push, create a PR, reset, clean, restore, or change branches. Existing dirty and untracked files are user work unless clearly produced by the current Ralph run. Known pre-existing work at plan creation time:
 
@@ -110,7 +110,7 @@ Missing or invalid `RALPH_AGENT` is a failed product iteration unless the failur
 
 ## Implementation Checklist
 
-- [ ] Inspect the current worktree, record dirty files in `.ralph/progress.md`, and confirm no implementation file is changed before this checkbox starts. Run `git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus status --short --branch`, `git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus diff --name-status`, and `npm.cmd test`. Done when the progress log records the baseline and tests either pass or the exact pre-existing failure is documented without code changes.
+- [ ] Inspect the current worktree, record dirty files in `.ralph/progress.md`, and confirm no implementation file is changed before this checkbox starts. Run `git status --short --branch`, `git diff --name-status`, and `npm.cmd test`. Done when the progress log records the baseline and tests either pass or the exact pre-existing failure is documented without code changes.
 
   Implementation details:
   - This is an inspection-only task.
@@ -425,8 +425,8 @@ Missing or invalid `RALPH_AGENT` is a failed product iteration unless the failur
   Commands:
   - `npm.cmd test`
   - `node .\bin\ralph-qa-harness.js --help`
-  - `git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus status --short --branch`
-  - `git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus diff --name-status`
+  - `git status --short --branch`
+  - `git diff --name-status`
 
   Completion evidence:
   - Record final validation in `.ralph/progress.md`.

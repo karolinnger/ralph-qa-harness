@@ -4,7 +4,7 @@
 
 This document is the complete handoff for an unattended `ralph-codex` implementation run.
 
-The target package is `ralph-qa-harness`, located at `C:\Users\kolos\IdeaProjects\Colossus`. There is no nested `ralph-qa-harness` subdirectory. Treat the repository root as the package root.
+The target package is `ralph-qa-harness`. There is no nested `ralph-qa-harness` subdirectory. Treat the repository root as the package root.
 
 The intended product is a lean QA harness CLI that supervises Playwright BDD work by launching the standalone Copilot CLI once per worker iteration. The product must be simple, file-backed, and explicit. It must not preserve the existing broad backend architecture unless a specific piece is required by the lean contract below.
 
@@ -85,11 +85,11 @@ If a behavior change requires tests, write or update the tests in the same check
 
 ## Required Initial Inspection
 
-Run these from `C:\Users\kolos\IdeaProjects\Colossus` before changing files:
+Run these from the repository root before changing files:
 
 ```powershell
-git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus status --short --branch
-git -c safe.directory=C:/Users/kolos/IdeaProjects/Colossus diff --name-status
+git status --short --branch
+git diff --name-status
 ```
 
 Record what is already dirty. Treat it as user work unless it is clearly produced by the current Ralph run.
@@ -99,7 +99,7 @@ Record what is already dirty. Treat it as user work unless it is clearly produce
 Initialize `.ralph/` only if needed:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js init
+node C:\path\to\ralph-codex\bin\ralph-codex.js init
 ```
 
 If initialization fails, stop and report:
@@ -148,7 +148,7 @@ Do not use a `validation` property. The Ralph CLI expects `validationCommands`.
 Import this file as the Ralph implementation plan:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js plan --from docs\superpowers\plans\2026-04-27-lean-copilot-qa-harness.md --force true
+node C:\path\to\ralph-codex\bin\ralph-codex.js plan --from docs\superpowers\plans\2026-04-27-lean-copilot-qa-harness.md --force true
 ```
 
 After import, verify `.ralph/IMPLEMENTATION_PLAN.md` contains the same checklist items.
@@ -158,7 +158,7 @@ After import, verify `.ralph/IMPLEMENTATION_PLAN.md` contains the same checklist
 Run doctor:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js doctor
+node C:\path\to\ralph-codex\bin\ralph-codex.js doctor
 ```
 
 If doctor fails because `codex.cmd` is unavailable, stop. Do not substitute `codex.ps1`.
@@ -166,14 +166,14 @@ If doctor fails because `codex.cmd` is unavailable, stop. Do not substitute `cod
 Start the first batch:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js run --max-iterations 40
+node C:\path\to\ralph-codex\bin\ralph-codex.js run --max-iterations 40
 ```
 
 After each batch:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js status
-node .\ralph-codex\bin\ralph-codex.js verify
+node C:\path\to\ralph-codex\bin\ralph-codex.js status
+node C:\path\to\ralph-codex\bin\ralph-codex.js verify
 ```
 
 Resume only when all of these are true:
@@ -188,7 +188,7 @@ Resume only when all of these are true:
 Resume command:
 
 ```powershell
-node .\ralph-codex\bin\ralph-codex.js run --resume true --max-iterations 40
+node C:\path\to\ralph-codex\bin\ralph-codex.js run --resume true --max-iterations 40
 ```
 
 ## End Of Run Report
