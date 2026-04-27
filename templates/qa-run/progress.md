@@ -13,11 +13,15 @@
   - Input: `<single source>`
   - Output: `<single artifact or code change>`
   - Verify: `<single proof step>`
-  - Worker: `<worker>`
+  - Owner: `<owner role>`
+  - Agent: `<agent role>`
+  - Mode: `<planning|implementation|verification|healing|routing>`
   - Status: `todo`
   - Retry budget: `1`
   - Result: ``
   - Evidence: ``
+  - Fallback reason: ``
+  - Block reason: ``
 
 ## Active Items
 
@@ -25,8 +29,12 @@
   - Input: `<feature path>`, `.qa-harness/PRD.md`, `.qa-harness/progress.md`, `.qa-harness/PROMPT.md`, `.qa-harness/normalized.feature`
   - Output: evidence recorded in `.qa-harness/progress.md`
   - Verify: `ralph-qa-harness verify` passes for run `<run-id>`
-  - Worker: `copilot`
+  - Owner: `<owner role>`
+  - Agent: `<agent role>`
+  - Mode: `<mode>`
   - Status: `todo`
   - Retry budget: `1`
   - Result: ``
   - Evidence: ``
+  - Fallback reason: ``
+  - Block reason: ``

@@ -42,7 +42,32 @@ const DEFAULT_EXECUTION_CONTROLS = Object.freeze({
   video: 'off',
   screenshot: 'off',
 });
+const DEFAULT_PRODUCT_MAX_ITERATIONS = 40;
 const DEFAULT_HARNESS_COMMAND_PREFIX = 'npx ralph-qa-harness';
+const QA_AGENT_ROLES = Object.freeze([
+  'qa-orchestrator',
+  'qa-planner',
+  'qa-executor',
+  'qa-verifier',
+]);
+const QA_AGENT_ROLE_SELECTION_ERROR_CODE = 'QA_AGENT_ROLE_SELECTION_ERROR';
+const QA_AGENT_TEMPLATE_DIR_NAMES = Object.freeze({
+  'qa-orchestrator': 'main-orchestrator',
+  'qa-planner': 'planner',
+  'qa-executor': 'executor',
+  'qa-verifier': 'verifier',
+});
+const QA_AGENT_ROLE_SET = new Set(QA_AGENT_ROLES);
+const PLANNER_PROGRESS_CONTRACT_REQUIRED_FIELDS = Object.freeze([
+  'Input',
+  'Output',
+  'Verify',
+  'Owner',
+  'Status',
+  'Retry budget',
+  'Result',
+  'Evidence',
+]);
 const HARNESS_DIR_NAME = '.qa-harness';
 const GENERATED_FEATURES_DIR_NAME = '.features-gen';
 const HARNESS_CONFIG_FILE = 'config.json';
@@ -56,13 +81,19 @@ const HARNESS_RUN_RESULT_FILE = 'result.json';
 const HARNESS_RUN_LOOP_REPORT_FILE = 'loop-report.md';
 const HARNESS_RUN_VALIDATION_FILE = 'validation.json';
 const HARNESS_RUN_DIFF_FILE = 'diff.patch';
+const HARNESS_RUN_SEED_SPEC_FILE = 'seed.spec.ts';
+const HARNESS_RUN_PLAYWRIGHT_CONFIG_FILE = 'playwright.config.ts';
 const HARNESS_RUN_ITERATIONS_DIR = 'iterations';
+const HARNESS_RUN_AGENTS_DIR = 'agents';
+const HARNESS_RUN_RESOLVED_PROMPTS_DIR = 'resolved-prompts';
 const HARNESS_ITERATION_WORKER_PROMPT_FILE = 'worker-prompt.md';
 const HARNESS_ITERATION_STDOUT_FILE = 'stdout.log';
 const HARNESS_ITERATION_STDERR_FILE = 'stderr.log';
 const HARNESS_ITERATION_SUMMARY_FILE = 'summary.json';
 const HARNESS_ITERATION_VALIDATION_FILE = 'validation.json';
 const HARNESS_ITERATION_DIFF_FILE = 'diff.patch';
+const HARNESS_ITERATION_EVIDENCE_DIR = 'evidence';
+const HARNESS_COVERAGE_PLAYWRIGHT_CLI_EVIDENCE_FILE = 'playwright-cli-seed.json';
 const HARNESS_ITERATION_DIFF_MAX_BYTES = 64 * 1024;
 const HARNESS_GIT_EXCLUDE_ENTRIES = Object.freeze([
   `${HARNESS_DIR_NAME}/`,
@@ -106,8 +137,31 @@ const REQUIRED_FILE_KEYS = [
   'healReportPath',
 ];
 
-const ACTIONABLE_PROGRESS_STATUSES = new Set(['todo', 'doing', 'fail']);
-const TERMINAL_PROGRESS_STATUSES = new Set(['pass', 'blocked']);
+const PROGRESS_LIFECYCLE_STATUSES = Object.freeze(['todo', 'doing', 'needs-verification', 'pass', 'fail', 'blocked']);
+const PROGRESS_LIFECYCLE_STATUS_SET = new Set(PROGRESS_LIFECYCLE_STATUSES);
+const ACTIONABLE_PROGRESS_STATUSES = new Set(
+  PROGRESS_LIFECYCLE_STATUSES.filter((status) => ['todo', 'doing', 'needs-verification', 'fail'].includes(status)),
+);
+const TERMINAL_PROGRESS_STATUSES = new Set(
+  PROGRESS_LIFECYCLE_STATUSES.filter((status) => ['pass', 'blocked'].includes(status)),
+);
+const COVERAGE_REQUEST_INTAKE_FIELDS = Object.freeze([
+  {
+    key: 'target',
+    label: 'target URL or app scope',
+    question: 'What target URL or explicit app scope should the coverage request cover?',
+  },
+  {
+    key: 'sourceContext',
+    label: 'Jira ticket link/text or pasted requirements',
+    question: 'What Jira ticket link/text or pasted requirements should define the requested coverage?',
+  },
+  {
+    key: 'acceptanceCriteria',
+    label: 'Acceptance criteria',
+    question: 'What acceptance criteria must the coverage work prove?',
+  },
+]);
 const PLAYWRIGHT_RUNTIME_ORDER = Object.freeze(['playwright-cli', 'playwright-test', 'mcp']);
 const PLAYWRIGHT_RUNTIME_LAYERS = new Set(PLAYWRIGHT_RUNTIME_ORDER);
 const GAP_ANALYSIS_ARTIFACT_TITLE = 'Gap Analysis';
@@ -260,6 +314,333 @@ function resolveTemplatesDir() {
   return path.join(resolvePackageRoot(), 'templates', 'qa-run');
 }
 
+function resolveQaAgentsTemplatesDir() {
+  return path.join(resolvePackageRoot(), 'templates', 'qa-agents');
+}
+
+function assertValidQaAgentRole(role) {
+  if (!QA_AGENT_ROLE_SET.has(role)) {
+    throw new Error(`Invalid QA agent role "${String(role)}". Valid roles: ${QA_AGENT_ROLES.join(', ')}.`);
+  }
+
+  return role;
+}
+
+function normalizeQaAgentRoleForArtifact(role) {
+  if (!hasMeaningfulString(role)) {
+    return '';
+  }
+
+  return assertValidQaAgentRole(role.trim());
+}
+
+function createQaAgentRoleSelectionError(message, details = {}) {
+  const error = new Error(message);
+  error.code = QA_AGENT_ROLE_SELECTION_ERROR_CODE;
+  Object.assign(error, details);
+  return error;
+}
+
+function isQaAgentRoleSelectionError(error) {
+  return Boolean(error && error.code === QA_AGENT_ROLE_SELECTION_ERROR_CODE);
+}
+
+function resolveQaAgentTemplatePaths(role) {
+  const validRole = assertValidQaAgentRole(role);
+  const templateDir = path.join(resolveQaAgentsTemplatesDir(), QA_AGENT_TEMPLATE_DIR_NAMES[validRole]);
+
+  return {
+    role: validRole,
+    templateDir,
+    agentPath: path.join(templateDir, 'agent.md'),
+    skillsPath: path.join(templateDir, 'skills.md'),
+  };
+}
+
+function resolveQaAgentRoleForProgressItem(selectedItem) {
+  const itemId = selectedItem && hasMeaningfulString(selectedItem.id) ? selectedItem.id : 'selected item';
+  const owner = selectedItem && hasMeaningfulString(selectedItem.owner) ? selectedItem.owner.trim() : '';
+
+  if (!owner) {
+    throw createQaAgentRoleSelectionError(
+      `Selected progress item ${itemId} is missing a QA agent Owner field. Valid roles: ${QA_AGENT_ROLES.join(', ')}.`,
+      { selectedItem, selectedOwner: '' },
+    );
+  }
+
+  if (!QA_AGENT_ROLE_SET.has(owner)) {
+    throw createQaAgentRoleSelectionError(
+      `Invalid QA agent role "${owner}" on selected progress item ${itemId}. Valid roles: ${QA_AGENT_ROLES.join(', ')}.`,
+      { selectedItem, selectedOwner: owner },
+    );
+  }
+
+  return owner;
+}
+
+function buildQaPlanningArtifactRouteItem(missingArtifacts) {
+  const missingList = Array.isArray(missingArtifacts) && missingArtifacts.length > 0
+    ? missingArtifacts.join(', ')
+    : 'required planning artifacts';
+  const block = buildProgressItemBlock({
+    itemId: 'PLAN-ARTIFACTS',
+    goal: 'create or repair the durable QA planning artifacts.',
+    input: `Missing artifacts: \`${sanitizeInlineCode(missingList)}\``,
+    output: 'Updated `.qa-harness/PRD.md`, `.qa-harness/progress.md`, and `.qa-harness/PROMPT.md`.',
+    verify: 'inspect durable planning artifacts',
+    owner: 'qa-planner',
+    agent: 'qa-planner',
+    mode: 'planning',
+    status: 'todo',
+    retryBudget: '1',
+    resultText: '',
+    evidence: '',
+    fallbackReason: '',
+  });
+
+  return parseProgressItemBlock(block, {
+    sectionTitle: 'Orchestrator Route',
+  });
+}
+
+function buildQaProgressContractRepairRouteItem(contractIssue) {
+  const item = contractIssue && contractIssue.item ? contractIssue.item : {};
+  const itemId = hasMeaningfulString(item.id) ? item.id : 'unknown progress item';
+  const issueSummary = contractIssue && Array.isArray(contractIssue.issues) && contractIssue.issues.length > 0
+    ? contractIssue.issues.join(', ')
+    : 'planner output contract fields';
+  const block = buildProgressItemBlock({
+    itemId: 'PLAN-PROGRESS-CONTRACT',
+    goal: 'repair stale or incomplete planner-authored progress artifacts.',
+    input: `Progress item \`${sanitizeInlineCode(itemId)}\` is missing or weakening: \`${sanitizeInlineCode(issueSummary)}\`.`,
+    output: 'Updated `.qa-harness/progress.md` with bounded items that satisfy the planner output contract.',
+    verify: 'inspect `.qa-harness/progress.md` for planner-authored items with required fields, seed proof, and full Playwright execution requirements',
+    owner: 'qa-planner',
+    agent: 'qa-planner',
+    mode: 'planning',
+    status: 'todo',
+    retryBudget: '1',
+    resultText: '',
+    evidence: '',
+    fallbackReason: '',
+  });
+
+  return parseProgressItemBlock(block, {
+    sectionTitle: 'Orchestrator Route',
+  });
+}
+
+function getMissingQaPlanningArtifacts(runPaths) {
+  return [
+    { path: runPaths.prdPath, displayPath: `${HARNESS_DIR_NAME}/${HARNESS_PRD_FILE}` },
+    { path: runPaths.progressPath, displayPath: `${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}` },
+    { path: runPaths.promptPath, displayPath: `${HARNESS_DIR_NAME}/${HARNESS_PROMPT_FILE}` },
+  ].filter((artifact) => !pathExists(artifact.path) || !fs.statSync(artifact.path).isFile())
+    .map((artifact) => artifact.displayPath);
+}
+
+function collectProgressContractIssues(item) {
+  const issues = [];
+
+  if (!item || !hasMeaningfulString(item.id)) {
+    issues.push('id');
+  }
+
+  if (!item || !hasMeaningfulString(item.goal)) {
+    issues.push('goal');
+  }
+
+  for (const label of PLANNER_PROGRESS_CONTRACT_REQUIRED_FIELDS) {
+    if (!item || !progressItemHasField(item.block || '', label)) {
+      issues.push(label);
+      continue;
+    }
+
+    if (label !== 'Result' && label !== 'Evidence' && !hasMeaningfulString(readProgressItemField(item.block, label))) {
+      issues.push(label);
+    }
+  }
+
+  return issues;
+}
+
+function findProgressContractIssue(items) {
+  for (const item of items) {
+    if (!item || !hasMeaningfulString(item.owner) || !QA_AGENT_ROLE_SET.has(item.owner)) {
+      continue;
+    }
+
+    const issues = collectProgressContractIssues(item);
+    if (issues.length > 0) {
+      return { item, issues };
+    }
+  }
+
+  return null;
+}
+
+function normalizeQaRouteMode(item, role, fallbackMode) {
+  if (hasMeaningfulString(fallbackMode)) {
+    return fallbackMode;
+  }
+
+  if (item && hasMeaningfulString(item.mode)) {
+    return item.mode.trim();
+  }
+
+  if (role === 'qa-planner') {
+    return 'planning';
+  }
+
+  if (role === 'qa-verifier') {
+    return 'verification';
+  }
+
+  if (role === 'qa-orchestrator') {
+    return 'routing';
+  }
+
+  return 'implementation';
+}
+
+function buildQaOrchestratorRoute(options) {
+  const role = assertValidQaAgentRole(options.role || 'qa-orchestrator');
+  return {
+    status: options.status || 'run',
+    stopReason: options.stopReason || null,
+    role,
+    mode: normalizeQaRouteMode(options.item, role, options.mode),
+    item: options.item || null,
+    reason: options.reason || '',
+    missingArtifacts: Array.isArray(options.missingArtifacts) ? options.missingArtifacts : [],
+  };
+}
+
+function selectQaOrchestratorRoute(runPaths) {
+  const missingArtifacts = getMissingQaPlanningArtifacts(runPaths);
+  if (missingArtifacts.length > 0) {
+    return buildQaOrchestratorRoute({
+      role: 'qa-planner',
+      mode: 'planning',
+      item: buildQaPlanningArtifactRouteItem(missingArtifacts),
+      reason: `Missing planning artifacts: ${missingArtifacts.join(', ')}.`,
+      missingArtifacts,
+    });
+  }
+
+  const progressContent = readText(runPaths.progressPath);
+  const parsedItems = parseProgressItems(progressContent);
+  const activeItems = parsedItems.filter((item) => item.sectionTitle === 'Active Items');
+  const items = activeItems.length > 0 ? activeItems : parsedItems;
+
+  if (items.length === 0) {
+    return buildQaOrchestratorRoute({
+      role: 'qa-planner',
+      mode: 'planning',
+      item: buildQaPlanningArtifactRouteItem([`${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}`]),
+      reason: 'No bounded progress items exist in .qa-harness/progress.md.',
+    });
+  }
+
+  const progressContractIssue = findProgressContractIssue(items);
+  if (progressContractIssue) {
+    return buildQaOrchestratorRoute({
+      role: 'qa-planner',
+      mode: 'planning',
+      item: buildQaProgressContractRepairRouteItem(progressContractIssue),
+      reason: `Progress item ${progressContractIssue.item.id} is missing required planner output contract fields: ${progressContractIssue.issues.join(', ')}.`,
+    });
+  }
+
+  const invalidStatusItem = items.find((item) => !PROGRESS_LIFECYCLE_STATUS_SET.has(item.status));
+  if (invalidStatusItem) {
+    return buildQaOrchestratorRoute({
+      status: 'failed',
+      stopReason: 'invalid-progress-status',
+      role: 'qa-orchestrator',
+      mode: 'routing',
+      item: invalidStatusItem,
+      reason: `Unsupported progress status "${invalidStatusItem.status}" on progress item ${invalidStatusItem.id}.`,
+    });
+  }
+
+  const blockedItem = items.find((item) => item.status === 'blocked');
+  if (blockedItem) {
+    return buildQaOrchestratorRoute({
+      status: 'blocked',
+      stopReason: 'blocked',
+      role: 'qa-orchestrator',
+      mode: 'routing',
+      item: blockedItem,
+      reason: `Progress item ${blockedItem.id} is blocked.`,
+    });
+  }
+
+  if (items.every((item) => item.status === 'pass')) {
+    return buildQaOrchestratorRoute({
+      status: 'completed',
+      stopReason: 'all-progress-passed',
+      role: 'qa-orchestrator',
+      mode: 'routing',
+      reason: 'All progress items are verifier-passed.',
+    });
+  }
+
+  const verificationItem = items.find((item) => item.status === 'needs-verification');
+  if (verificationItem) {
+    return buildQaOrchestratorRoute({
+      role: 'qa-verifier',
+      mode: 'verification',
+      item: verificationItem,
+      reason: `Progress item ${verificationItem.id} needs verifier review.`,
+    });
+  }
+
+  const failedRetryItem = items.find((item) => item.status === 'fail' && parseRetryBudgetValue(item.retryBudget) > 0);
+  if (failedRetryItem) {
+    return buildQaOrchestratorRoute({
+      role: 'qa-executor',
+      mode: 'healing',
+      item: failedRetryItem,
+      reason: `Progress item ${failedRetryItem.id} failed verification with retry budget remaining.`,
+    });
+  }
+
+  const failedExhaustedItem = items.find((item) => item.status === 'fail');
+  if (failedExhaustedItem) {
+    return buildQaOrchestratorRoute({
+      status: 'failed',
+      stopReason: 'retry-budget-exhausted',
+      role: 'qa-orchestrator',
+      mode: 'routing',
+      item: failedExhaustedItem,
+      reason: `Progress item ${failedExhaustedItem.id} failed and has no retry budget remaining.`,
+    });
+  }
+
+  const runnableItem = items.find((item) => item.status === 'todo' || item.status === 'doing');
+  if (runnableItem) {
+    const role = resolveQaAgentRoleForProgressItem(runnableItem);
+    return buildQaOrchestratorRoute({
+      role,
+      item: runnableItem,
+      reason: `Progress item ${runnableItem.id} is ready for ${role}.`,
+    });
+  }
+
+  return buildQaOrchestratorRoute({
+    status: 'completed',
+    stopReason: 'no-actionable-items',
+    role: 'qa-orchestrator',
+    mode: 'routing',
+    reason: 'No actionable progress item remains.',
+  });
+}
+
+function formatQaAgentTemplateDisplayPath(filePath) {
+  return normalizeDisplayPath(path.relative(resolvePackageRoot(), filePath));
+}
+
 function getHarnessCommandPrefix(env = process.env) {
   const rawPrefix = typeof env.QA_HARNESS_COMMAND_PREFIX === 'string'
     ? env.QA_HARNESS_COMMAND_PREFIX.trim()
@@ -344,6 +725,31 @@ function assertDurableHarnessPaths(paths) {
   }
 }
 
+function assertRunScopedHarnessPaths(paths) {
+  if (!hasMeaningfulString(paths.runId) || !hasMeaningfulString(paths.runDir)) {
+    return;
+  }
+
+  const runScopedKeys = [
+    'resultPath',
+    'loopReportPath',
+    'validationPath',
+    'diffPatchPath',
+    'seedSpecPath',
+    'playwrightConfigPath',
+    'iterationsDir',
+    'agentsDir',
+    'resolvedPromptsDir',
+  ];
+
+  for (const key of runScopedKeys) {
+    const value = paths[key];
+    if (hasMeaningfulString(value) && !isPathWithin(paths.runDir, value)) {
+      throw new Error(`${key} must stay under ${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/<run-id>.`);
+    }
+  }
+}
+
 function resolveHarnessPaths(repoRoot, options = {}) {
   const root = path.resolve(repoRoot);
   const harnessDir = path.join(root, HARNESS_DIR_NAME);
@@ -375,10 +781,15 @@ function resolveHarnessPaths(repoRoot, options = {}) {
     loopReportPath: path.join(runDir, HARNESS_RUN_LOOP_REPORT_FILE),
     validationPath: path.join(runDir, HARNESS_RUN_VALIDATION_FILE),
     diffPatchPath: path.join(runDir, HARNESS_RUN_DIFF_FILE),
+    seedSpecPath: path.join(runDir, HARNESS_RUN_SEED_SPEC_FILE),
+    playwrightConfigPath: path.join(runDir, HARNESS_RUN_PLAYWRIGHT_CONFIG_FILE),
     iterationsDir: path.join(runDir, HARNESS_RUN_ITERATIONS_DIR),
+    agentsDir: path.join(runDir, HARNESS_RUN_AGENTS_DIR),
+    resolvedPromptsDir: path.join(runDir, HARNESS_RUN_AGENTS_DIR, HARNESS_RUN_RESOLVED_PROMPTS_DIR),
   };
 
   assertDurableHarnessPaths(runPaths);
+  assertRunScopedHarnessPaths(runPaths);
   return runPaths;
 }
 
@@ -412,7 +823,10 @@ function resolveGeneratedHarnessPaths(repoRoot, options = {}) {
 }
 
 function formatVerifyRunSummary(result) {
-  return `${result.exportedStepCount} exported steps, ${result.listedTestCount} listed tests`;
+  const executedSegment = Number.isInteger(result.executedTestCount)
+    ? `, ${result.executedTestCount} executed tests`
+    : '';
+  return `${result.exportedStepCount} exported steps, ${result.listedTestCount} listed tests${executedSegment}`;
 }
 
 function formatClarifierSummary(request) {
@@ -536,6 +950,263 @@ function normalizeConstraintList(values) {
   }
 
   return normalizedConstraints;
+}
+
+function normalizeCoverageRequestText(value) {
+  return typeof value === 'string' ? value.replace(/\r\n/g, '\n').trim() : '';
+}
+
+function stripTerminalPunctuation(value) {
+  return value.replace(/[),.;]+$/g, '').trim();
+}
+
+function readCoverageRequestSection(requestText, labelPatterns) {
+  const lines = requestText.split('\n');
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const labelMatch = line.match(/^\s*([^:]{1,60}):\s*(.*)$/);
+    if (!labelMatch) {
+      continue;
+    }
+
+    const label = labelMatch[1].trim();
+    if (!labelPatterns.some((pattern) => pattern.test(label))) {
+      continue;
+    }
+
+    const values = [];
+    if (labelMatch[2].trim()) {
+      values.push(labelMatch[2].trim());
+    }
+
+    for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+      const nextLine = lines[nextIndex];
+      if (/^\s*[^:]{1,60}:\s*/.test(nextLine)) {
+        break;
+      }
+      if (nextLine.trim()) {
+        values.push(nextLine.trim());
+      }
+    }
+
+    return values.join('\n').trim();
+  }
+
+  return '';
+}
+
+function extractCoverageRequestUrls(value) {
+  return Array.from(value.matchAll(/https?:\/\/[^\s"'`<>)]+/gi))
+    .map((match) => stripTerminalPunctuation(match[0]))
+    .filter(Boolean);
+}
+
+function isJiraReference(value) {
+  return /\b[A-Z][A-Z0-9]+-\d+\b/u.test(value) || /(?:^|[./-])jira(?:[./-]|$)/i.test(value);
+}
+
+function parseCoverageAcceptanceCriteria(requestText) {
+  const section = readCoverageRequestSection(requestText, [
+    /^acceptance criteria$/i,
+    /^acceptance$/i,
+    /^criteria$/i,
+  ]);
+
+  const criteria = section
+    .split('\n')
+    .map((line) => line.replace(/^\s*(?:[-*]\s+|\d+[.)]\s+)/, '').trim())
+    .filter(Boolean);
+
+  if (criteria.length === 0) {
+    throw new Error('prepare --request requires acceptance criteria.');
+  }
+
+  return criteria;
+}
+
+function parseCoverageRequestTarget(requestText) {
+  const targetUrlSection = readCoverageRequestSection(requestText, [
+    /^target url$/i,
+    /^target$/i,
+    /^url$/i,
+  ]);
+  const targetUrl = extractCoverageRequestUrls(targetUrlSection)[0];
+
+  if (targetUrl) {
+    return {
+      type: 'url',
+      value: targetUrl,
+    };
+  }
+
+  const appScope = sanitizeInlineCode(readCoverageRequestSection(requestText, [
+    /^app scope$/i,
+    /^application scope$/i,
+    /^scope$/i,
+  ]));
+
+  if (appScope) {
+    return {
+      type: 'app-scope',
+      value: appScope,
+    };
+  }
+
+  const requestUrl = extractCoverageRequestUrls(requestText).find((url) => !isJiraReference(url));
+  if (requestUrl) {
+    return {
+      type: 'url',
+      value: requestUrl,
+    };
+  }
+
+  throw new Error('prepare --request requires a target URL or app scope.');
+}
+
+function parseCoverageRequestSourceContext(requestText, requirements) {
+  const ticketSection = readCoverageRequestSection(requestText, [
+    /^jira$/i,
+    /^jira ticket$/i,
+    /^ticket$/i,
+    /^source$/i,
+  ]);
+  const jiraUrl = extractCoverageRequestUrls(ticketSection).find(isJiraReference);
+  const jiraKeyMatch = ticketSection.match(/\b[A-Z][A-Z0-9]+-\d+\b/u);
+
+  if (jiraUrl || jiraKeyMatch) {
+    return {
+      type: 'jira',
+      value: jiraUrl || jiraKeyMatch[0],
+    };
+  }
+
+  const firstJiraUrl = extractCoverageRequestUrls(requestText).find(isJiraReference);
+  if (firstJiraUrl) {
+    return {
+      type: 'jira',
+      value: firstJiraUrl,
+    };
+  }
+
+  const firstJiraKey = requestText.match(/\b[A-Z][A-Z0-9]+-\d+\b/u);
+  if (firstJiraKey) {
+    return {
+      type: 'jira',
+      value: firstJiraKey[0],
+    };
+  }
+
+  if (requirements) {
+    return {
+      type: 'requirements',
+      value: requirements,
+    };
+  }
+
+  throw new Error('prepare --request requires a Jira ticket link/text or pasted requirements.');
+}
+
+function parseCoverageRequestRequirements(requestText) {
+  return sanitizeInlineCode(readCoverageRequestSection(requestText, [
+    /^requirements?$/i,
+    /^requirements? text$/i,
+    /^pasted requirements?$/i,
+  ]));
+}
+
+function getCoverageRequestIntakeField(key) {
+  return COVERAGE_REQUEST_INTAKE_FIELDS.find((field) => field.key === key);
+}
+
+function describeCoverageRequestMissingFields(missingFields) {
+  return missingFields
+    .map((key) => {
+      const field = getCoverageRequestIntakeField(key);
+      return field ? field.label : key;
+    });
+}
+
+function buildCoverageRequestFollowUpQuestions(missingFields) {
+  return missingFields
+    .map((key) => {
+      const field = getCoverageRequestIntakeField(key);
+      return field ? field.question : `What value should be used for ${key}?`;
+    });
+}
+
+function isCoverageRequestMissingFieldError(error) {
+  return error instanceof Error && /^prepare --request requires /i.test(error.message);
+}
+
+function readCoverageRequestIntakeField(key, readField) {
+  try {
+    return {
+      value: readField(),
+      missing: null,
+    };
+  } catch (error) {
+    if (!isCoverageRequestMissingFieldError(error)) {
+      throw error;
+    }
+
+    return {
+      value: null,
+      missing: key,
+    };
+  }
+}
+
+function normalizePrepareCoverageRequest(requestText, options = {}) {
+  const normalizedRequestText = normalizeCoverageRequestText(requestText);
+
+  if (!normalizedRequestText) {
+    throw new Error('prepare --request requires non-empty request text.');
+  }
+
+  const requirements = parseCoverageRequestRequirements(normalizedRequestText);
+  const target = readCoverageRequestIntakeField(
+    'target',
+    () => parseCoverageRequestTarget(normalizedRequestText),
+  );
+  const sourceContext = readCoverageRequestIntakeField(
+    'sourceContext',
+    () => parseCoverageRequestSourceContext(normalizedRequestText, requirements),
+  );
+  const acceptanceCriteria = readCoverageRequestIntakeField(
+    'acceptanceCriteria',
+    () => parseCoverageAcceptanceCriteria(normalizedRequestText),
+  );
+  const missingFields = [target.missing, sourceContext.missing, acceptanceCriteria.missing]
+    .filter(Boolean);
+
+  return {
+    kind: 'coverage-request',
+    requestText: normalizedRequestText,
+    status: missingFields.length > 0 ? 'blocked' : 'accepted',
+    complete: missingFields.length === 0,
+    target: target.value,
+    sourceContext: sourceContext.value,
+    requirements,
+    acceptanceCriteria: acceptanceCriteria.value || [],
+    constraints: normalizeConstraintList(options.constraints),
+    missingFields,
+    followUpQuestions: buildCoverageRequestFollowUpQuestions(missingFields),
+  };
+}
+
+function normalizePrepareCoverageRequestOption(request, options = {}) {
+  if (request && typeof request === 'object' && request.kind === 'coverage-request') {
+    return request;
+  }
+
+  if (request && typeof request === 'object' && hasMeaningfulString(request.request)) {
+    return normalizePrepareCoverageRequest(request.request, {
+      constraints: request.constraints || options.constraints,
+    });
+  }
+
+  return normalizePrepareCoverageRequest(request, options);
 }
 
 function extractFreeformPrepareRunField(requestText, definitions, label, defaultValue) {
@@ -800,7 +1471,9 @@ function stampProgressTemplate(template, data) {
   content = replaceOnce(content, '<single source>', 'one source artifact', 'progress.md');
   content = replaceOnce(content, '<single artifact or code change>', 'one artifact or code change', 'progress.md');
   content = replaceOnce(content, '<single proof step>', 'one proof step', 'progress.md');
-  content = replaceOnce(content, '<worker>', 'copilot', 'progress.md');
+  content = content.replace(/<owner role>/g, 'qa-executor');
+  content = content.replace(/<agent role>/g, 'qa-executor');
+  content = content.replace(/<mode>/g, 'implementation');
   content = replaceOnce(content, '<feature path>', data.sourceRefDisplay, 'progress.md');
 
   return content;
@@ -925,7 +1598,9 @@ function buildLeanPrepareProgress(sourceDisplayPath) {
     `  - Input: \`${sourceDisplayPath}\` and \`.qa-harness/normalized.feature\``,
     '  - Output: Copilot evidence recorded in `.qa-harness/runs/<run-id>/iterations/<nnn>/` and `.qa-harness/progress.md`.',
     '  - Verify: `ralph-qa-harness verify` passes and lists generated run-backed tests.',
-    '  - Owner: `copilot`',
+    '  - Owner: `qa-executor`',
+    '  - Agent: `qa-executor`',
+    '  - Mode: `implementation`',
     '  - Status: `todo`',
     '  - Retry budget: `1`',
     '  - Result: ``',
@@ -958,13 +1633,313 @@ function buildLeanPreparePrompt() {
   ].join('\n');
 }
 
+function buildLeanPrepareConfig(platform) {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    loop: {
+      defaultMaxIterations: DEFAULT_PRODUCT_MAX_ITERATIONS,
+    },
+    copilot: {
+      command: resolveDefaultCopilotCommand(platform || process.platform),
+    },
+  }, null, 2)}\n`;
+}
+
+function formatCoverageRequestIntakeValue(value, fallback = 'missing') {
+  if (!value) {
+    return fallback;
+  }
+
+  if (typeof value === 'string') {
+    return hasMeaningfulString(value) ? value : fallback;
+  }
+
+  if (typeof value === 'object' && hasMeaningfulString(value.value)) {
+    return `${value.type}: ${value.value}`;
+  }
+
+  return fallback;
+}
+
+function buildBlockedCoverageIntakePrd(coverageRequest) {
+  const missingLabels = describeCoverageRequestMissingFields(coverageRequest.missingFields);
+  const criteria = Array.isArray(coverageRequest.acceptanceCriteria)
+    ? coverageRequest.acceptanceCriteria
+    : [];
+  const constraints = normalizeConstraintList(coverageRequest.constraints);
+
+  return [
+    '# QA Harness PRD',
+    '',
+    '## Blocked Coverage Intake',
+    '',
+    'Status: blocked',
+    '',
+    `Target: ${formatCoverageRequestIntakeValue(coverageRequest.target)}`,
+    `Source context: ${formatCoverageRequestIntakeValue(coverageRequest.sourceContext)}`,
+    `Requirements: ${formatCoverageRequestIntakeValue(coverageRequest.requirements)}`,
+    '',
+    'Acceptance criteria:',
+    ...(criteria.length > 0 ? criteria.map((entry) => `- ${entry}`) : ['- missing']),
+    '',
+    'Constraints:',
+    ...(constraints.length > 0 ? constraints.map((entry) => `- ${entry}`) : ['- none recorded']),
+    '',
+    'Missing fields:',
+    ...missingLabels.map((label) => `- ${label}`),
+    '',
+    'Follow-up questions:',
+    ...coverageRequest.followUpQuestions.map((question, index) => `${index + 1}. ${question}`),
+    '',
+    'Submitted request:',
+    '',
+    '```text',
+    coverageRequest.requestText,
+    '```',
+    '',
+    'No feature or BDD artifacts are generated until intake is complete.',
+    '',
+  ].join('\n');
+}
+
+function buildBlockedCoverageIntakeProgress(coverageRequest) {
+  const missingLabels = describeCoverageRequestMissingFields(coverageRequest.missingFields);
+  const missingKeys = coverageRequest.missingFields.join(', ');
+
+  return [
+    '# QA Harness Progress',
+    '',
+    '## Active Items',
+    '',
+    buildProgressItemBlock({
+      itemId: 'INTAKE-001',
+      goal: 'collect the missing coverage request intake before planning work.',
+      input: 'Incomplete `prepare --request` intake recorded in `.qa-harness/PRD.md`.',
+      output: 'Complete coverage intake with target scope, source context, and acceptance criteria.',
+      verify: 'rerun `ralph-qa-harness prepare --request <text>` with the missing fields supplied',
+      owner: 'qa-orchestrator',
+      agent: 'qa-orchestrator',
+      mode: 'intake',
+      status: 'blocked',
+      retryBudget: '0',
+      resultText: 'blocked: coverage request intake is incomplete',
+      evidence: `Missing fields: ${missingLabels.join('; ')}`,
+      fallbackReason: '',
+      blockReason: `Missing fields: ${missingKeys}`,
+    }),
+    '',
+  ].join('\n');
+}
+
+function buildBlockedCoverageIntakeOutput(coverageRequest) {
+  const missingLabels = describeCoverageRequestMissingFields(coverageRequest.missingFields);
+
+  return [
+    'Coverage request intake is blocked.',
+    'Missing fields:',
+    ...missingLabels.map((label) => `- ${label}`),
+    'Follow-up questions:',
+    ...coverageRequest.followUpQuestions.map((question, index) => `${index + 1}. ${question}`),
+    '',
+  ].join('\n');
+}
+
+function buildAcceptedCoverageRequestPrd(coverageRequest) {
+  const criteria = Array.isArray(coverageRequest.acceptanceCriteria)
+    ? coverageRequest.acceptanceCriteria
+    : [];
+  const constraints = normalizeConstraintList(coverageRequest.constraints);
+
+  return [
+    '# QA Harness PRD',
+    '',
+    '## Accepted Coverage Request',
+    '',
+    'Status: accepted',
+    '',
+    `Target: ${formatCoverageRequestIntakeValue(coverageRequest.target)}`,
+    `Source context: ${formatCoverageRequestIntakeValue(coverageRequest.sourceContext)}`,
+    `Requirements: ${formatCoverageRequestIntakeValue(coverageRequest.requirements, 'none recorded')}`,
+    '',
+    'Acceptance criteria:',
+    ...criteria.map((entry) => `- ${entry}`),
+    '',
+    'Constraints:',
+    ...(constraints.length > 0 ? constraints.map((entry) => `- ${entry}`) : ['- none recorded']),
+    '',
+    'Planning notes:',
+    '- Convert the accepted scope, source context, constraints, and acceptance criteria into bounded QA progress items.',
+    '- Keep durable planning memory in `.qa-harness/PRD.md`, `.qa-harness/progress.md`, and `.qa-harness/PROMPT.md`.',
+    '- Do not create final BDD feature or step files during preparation.',
+    '',
+    'Submitted request:',
+    '',
+    '```text',
+    coverageRequest.requestText,
+    '```',
+    '',
+  ].join('\n');
+}
+
+function buildAcceptedCoverageRequestProgress(coverageRequest) {
+  return [
+    '# QA Harness Progress',
+    '',
+    '## Active Items',
+    '',
+    buildProgressItemBlock({
+      itemId: 'PLAN-001',
+      goal: 'convert the accepted coverage request into bounded QA coverage work.',
+      input: 'Accepted coverage request in `.qa-harness/PRD.md` with scope, source context, constraints, and acceptance criteria.',
+      output: 'Refined `.qa-harness/PRD.md`, `.qa-harness/progress.md`, and `.qa-harness/PROMPT.md` with bounded implementation and verification items that include seed proof and full Playwright execution requirements.',
+      verify: 'inspect `.qa-harness/progress.md` for one worker iteration items with id, goal, input, output, verify command or proof requirement, owner, status, retry budget, result, and evidence fields plus seed proof and full Playwright execution requirements',
+      owner: 'qa-planner',
+      agent: 'qa-planner',
+      mode: 'planning',
+      status: 'todo',
+      retryBudget: '1',
+      resultText: '',
+      evidence: '',
+      fallbackReason: '',
+    }),
+    '',
+  ].join('\n');
+}
+
+function buildAcceptedCoverageRequestPrompt() {
+  return [
+    '# Copilot Worker Rules',
+    '',
+    '- Complete exactly one selected unchecked item from `.qa-harness/progress.md` per Copilot process.',
+    '- Use `.qa-harness/PRD.md` as the durable objective.',
+    '- Use `.qa-harness/progress.md` as durable progress.',
+    '- Use `.qa-harness/PROMPT.md` as durable worker rules.',
+    '- Use `.qa-harness/` files as durable memory.',
+    '- Keep accepted coverage request scope, source context, constraints, and acceptance criteria in `.qa-harness/` artifacts.',
+    '- Planner output contract: every planner-authored progress item must include id, goal, input, output, verify command or proof requirement, owner, status, retry budget, result, and evidence fields.',
+    '- Coverage tasks must be small enough for one worker iteration and must include seed proof plus full Playwright execution requirements before verifier pass.',
+    '- Do not create final BDD feature or step files during preparation.',
+    '- Do not stage, commit, push, or create a pull request.',
+    '- Keep durable harness state in `.qa-harness/`.',
+    '- The supervisor will run `ralph-qa-harness verify` after worker exit.',
+    '',
+    'Every response must end with this exact four-line Ralph footer:',
+    '',
+    'RALPH_STATUS: pass|blocked|fail',
+    'RALPH_SUMMARY: <one concise paragraph>',
+    'RALPH_VALIDATION: <commands run, or why not run>',
+    'RALPH_NEXT: <next recommended action, or none>',
+    '',
+  ].join('\n');
+}
+
+function removeFileIfExists(filePath) {
+  if (pathExists(filePath) && fs.statSync(filePath).isFile()) {
+    fs.unlinkSync(filePath);
+  }
+}
+
+function writeBlockedCoverageIntakeArtifacts(repoRoot, harnessPaths, coverageRequest, options = {}) {
+  const preparedAt = (options.now instanceof Date ? options.now : new Date()).toISOString();
+
+  ensureHarnessGitInfoExclude(repoRoot);
+  fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
+  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
+  writeText(harnessPaths.prdPath, buildBlockedCoverageIntakePrd(coverageRequest));
+  writeText(harnessPaths.progressPath, buildBlockedCoverageIntakeProgress(coverageRequest));
+  writeText(harnessPaths.promptPath, buildLeanPreparePrompt());
+  removeFileIfExists(harnessPaths.normalizedFeaturePath);
+  writeText(
+    harnessPaths.statePath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      intake: {
+        kind: 'coverage-request',
+        status: 'blocked',
+        requestText: coverageRequest.requestText,
+        target: coverageRequest.target,
+        sourceContext: coverageRequest.sourceContext,
+        requirements: coverageRequest.requirements,
+        acceptanceCriteria: coverageRequest.acceptanceCriteria,
+        constraints: coverageRequest.constraints,
+        missingFields: coverageRequest.missingFields,
+        followUpQuestions: coverageRequest.followUpQuestions,
+      },
+      preparedAt,
+      latestRunId: null,
+      activeRunId: null,
+      terminalStatus: 'blocked',
+    }, null, 2)}\n`,
+  );
+}
+
+function writeAcceptedCoverageRequestArtifacts(repoRoot, harnessPaths, coverageRequest, options = {}) {
+  const preparedAt = (options.now instanceof Date ? options.now : new Date()).toISOString();
+
+  ensureHarnessGitInfoExclude(repoRoot);
+  fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
+  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
+  writeText(harnessPaths.prdPath, buildAcceptedCoverageRequestPrd(coverageRequest));
+  writeText(harnessPaths.progressPath, buildAcceptedCoverageRequestProgress(coverageRequest));
+  writeText(harnessPaths.promptPath, buildAcceptedCoverageRequestPrompt());
+  removeFileIfExists(harnessPaths.normalizedFeaturePath);
+  writeText(
+    harnessPaths.statePath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      intake: {
+        kind: 'coverage-request',
+        status: 'accepted',
+        requestText: coverageRequest.requestText,
+        target: coverageRequest.target,
+        sourceContext: coverageRequest.sourceContext,
+        requirements: coverageRequest.requirements,
+        acceptanceCriteria: coverageRequest.acceptanceCriteria,
+        constraints: coverageRequest.constraints,
+      },
+      preparedAt,
+      latestRunId: null,
+      activeRunId: null,
+      terminalStatus: null,
+    }, null, 2)}\n`,
+  );
+}
+
 function prepare(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
   const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
   const sourceRef = hasMeaningfulString(options.from) ? options.from.trim() : '';
+  const hasCoverageRequest = options.request != null;
+
+  if (sourceRef && hasCoverageRequest) {
+    throw new Error('prepare accepts either --from or --request, but not both.');
+  }
+
+  if (hasCoverageRequest) {
+    const coverageRequest = normalizePrepareCoverageRequestOption(options.request, {
+      constraints: options.constraints,
+    });
+
+    if (!coverageRequest.complete) {
+      writeBlockedCoverageIntakeArtifacts(repoRoot, harnessPaths, coverageRequest, options);
+      return {
+        status: 'blocked',
+        exitCode: 1,
+        request: coverageRequest,
+        output: buildBlockedCoverageIntakeOutput(coverageRequest),
+      };
+    }
+
+    writeAcceptedCoverageRequestArtifacts(repoRoot, harnessPaths, coverageRequest, options);
+    return {
+      status: 'pass',
+      request: coverageRequest,
+      output: `Accepted coverage request for ${coverageRequest.target.value}.\n`,
+    };
+  }
 
   if (!sourceRef) {
-    throw new Error('Missing required option --from for prepare.');
+    throw new Error('Missing required option --from or --request for prepare.');
   }
 
   const sourcePath = path.resolve(repoRoot, sourceRef);
@@ -984,15 +1959,7 @@ function prepare(options = {}) {
   ensureHarnessGitInfoExclude(repoRoot);
   fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
 
-  writeText(
-    harnessPaths.configPath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      copilot: {
-        command: resolveDefaultCopilotCommand(options.platform || process.platform),
-      },
-    }, null, 2)}\n`,
-  );
+  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
   writeText(harnessPaths.prdPath, buildLeanPreparePrd(sourceDisplayPath, featureMetadata));
   writeText(harnessPaths.progressPath, buildLeanPrepareProgress(sourceDisplayPath));
   writeText(harnessPaths.promptPath, buildLeanPreparePrompt());
@@ -1154,7 +2121,7 @@ function status(options = {}) {
 }
 
 function getLeanRunExitCode(status) {
-  return ['failed', 'blocked', 'stalled'].includes(status) ? 1 : 0;
+  return ['failed', 'blocked', 'budget-exhausted', 'stalled'].includes(status) ? 1 : 0;
 }
 
 function buildLeanRunResultOutput(runId, iterationCount, status, stopReason) {
@@ -1171,11 +2138,21 @@ function classifyLeanFooterStopReason(footerError) {
 
 function describeLeanRunStop(status, stopReason) {
   const summaries = {
+    'all-progress-passed': 'All required progress items are verifier-passed.',
     blocked: 'The Copilot worker reported RALPH_STATUS: blocked.',
     'budget-exhausted': 'Budget was exhausted before all progress items completed.',
+    'coverage-cli-evidence-required': 'MCP fallback was reported before Playwright CLI seed evidence existed.',
+    'coverage-mcp-fallback-evidence-required': 'MCP fallback was reported without durable MCP evidence.',
+    'coverage-mcp-fallback-reason-required': 'MCP fallback was reported without a fallback reason.',
+    'coverage-mcp-fallback-requires-failed-cli': 'MCP fallback was reported even though Playwright CLI seed discovery succeeded.',
+    'coverage-promotion-explanation-required': 'Promoted BDD or framework code materially differed from seed proof without explanation.',
+    'coverage-promotion-seed-proof-required': 'Promotion was reported before Playwright CLI seed proof existed.',
     'invalid-footer': 'The Copilot worker returned an invalid Ralph footer.',
+    'invalid-agent-role': 'The selected progress item did not name a valid QA agent role.',
+    'invalid-progress-status': 'A progress item used an unsupported lifecycle status.',
     'missing-footer': 'The Copilot worker did not return the required Ralph footer.',
     'no-actionable-items': 'No unchecked actionable progress item remains.',
+    'retry-budget-exhausted': 'A failed progress item has no retry budget remaining.',
     'selected-item-not-completed': 'The selected progress item was not completed after a pass footer and supervisor verify pass.',
     'validation-failed': 'Supervisor verification failed after the worker reported pass.',
     'worker-exit-nonzero': 'The Copilot worker process exited nonzero.',
@@ -1218,7 +2195,13 @@ function buildLeanLoopReport(result) {
   if (lastIteration) {
     lines.push('', 'Last iteration:');
     lines.push(`- Iteration: ${lastIteration.iteration}`);
+    if (hasMeaningfulString(lastIteration.RALPH_AGENT)) {
+      lines.push(`- RALPH_AGENT: ${lastIteration.RALPH_AGENT}`);
+    }
     lines.push(`- Worker exit code: ${lastIteration.exitCode}`);
+    if (hasMeaningfulString(lastIteration.roleError)) {
+      lines.push(`- Role error: ${lastIteration.roleError}`);
+    }
     if (lastIteration.footerError) {
       lines.push(`- Footer error: ${lastIteration.footerError}`);
     }
@@ -1230,6 +2213,16 @@ function buildLeanLoopReport(result) {
     }
   }
 
+  if (Array.isArray(result.iterations) && result.iterations.length > 0) {
+    lines.push('', 'Iteration roles:');
+    for (const iteration of result.iterations) {
+      lines.push(`- Iteration ${iteration.iteration}: RALPH_AGENT ${iteration.RALPH_AGENT || 'unknown'}`);
+      if (hasMeaningfulString(iteration.roleError)) {
+        lines.push(`  Role error: ${iteration.roleError}`);
+      }
+    }
+  }
+
   return `${lines.join('\n')}\n`;
 }
 
@@ -1238,6 +2231,7 @@ function writeLeanRunTerminalArtifacts(repoRoot, runId, result) {
   fs.mkdirSync(runPaths.runDir, { recursive: true });
   writeText(runPaths.resultPath, `${JSON.stringify(result, null, 2)}\n`);
   writeText(runPaths.loopReportPath, buildLeanLoopReport(result));
+  writeText(runPaths.diffPatchPath, buildLeanRunDiffPatch(repoRoot, runId, result));
 }
 
 function normalizeWorkerCommandResult(result) {
@@ -1260,7 +2254,35 @@ function resolveLeanIterationPaths(runPaths, iteration) {
     summaryPath: path.join(iterationDir, HARNESS_ITERATION_SUMMARY_FILE),
     validationPath: path.join(iterationDir, HARNESS_ITERATION_VALIDATION_FILE),
     diffPatchPath: path.join(iterationDir, HARNESS_ITERATION_DIFF_FILE),
+    evidenceDir: path.join(iterationDir, HARNESS_ITERATION_EVIDENCE_DIR),
+    coveragePlaywrightCliEvidencePath: path.join(
+      iterationDir,
+      HARNESS_ITERATION_EVIDENCE_DIR,
+      HARNESS_COVERAGE_PLAYWRIGHT_CLI_EVIDENCE_FILE,
+    ),
   };
+}
+
+function resolveLeanResolvedPromptAuditPath(runPaths, iterationPaths, role) {
+  const selectedRole = assertValidQaAgentRole(role);
+  const fileName = `${iterationPaths.iterationDirectoryName}-${selectedRole}.md`;
+  const resolvedPromptPath = path.join(runPaths.resolvedPromptsDir, fileName);
+
+  if (
+    !isPathWithin(runPaths.runDir, resolvedPromptPath)
+    || !isPathWithin(runPaths.runsDir, resolvedPromptPath)
+  ) {
+    throw new Error('Resolved prompt audit path must stay under .qa-harness/runs/<run-id>.');
+  }
+
+  return resolvedPromptPath;
+}
+
+function writeLeanResolvedPromptAuditCopy(runPaths, iterationPaths, role, workerPrompt) {
+  const resolvedPromptPath = resolveLeanResolvedPromptAuditPath(runPaths, iterationPaths, role);
+  fs.mkdirSync(path.dirname(resolvedPromptPath), { recursive: true });
+  writeText(resolvedPromptPath, workerPrompt);
+  return resolvedPromptPath;
 }
 
 function shouldSkipIterationSnapshotDirectory(repoRoot, directoryPath) {
@@ -1420,6 +2442,39 @@ function buildIterationDiffPatch(changes) {
   return lines.join('\n');
 }
 
+function buildLeanRunDiffPatch(repoRoot, runId, result) {
+  const runPaths = resolveHarnessPaths(repoRoot, { runId });
+  const iterationRecords = Array.isArray(result && result.iterations) ? result.iterations : [];
+  if (iterationRecords.length === 0) {
+    return 'No worker iterations ran for this run.\n';
+  }
+
+  const sections = [];
+  for (const record of iterationRecords) {
+    if (!record || !Number.isInteger(record.iteration)) {
+      continue;
+    }
+
+    const iterationPaths = resolveLeanIterationPaths(runPaths, record.iteration);
+    const agent = hasMeaningfulString(record.RALPH_AGENT) ? record.RALPH_AGENT : 'unknown';
+    const diffPatch = pathExists(iterationPaths.diffPatchPath)
+      ? readText(iterationPaths.diffPatchPath).trimEnd()
+      : 'No iteration diff artifact was recorded.';
+    sections.push([
+      `# Iteration ${record.iteration}: RALPH_AGENT ${agent}`,
+      '',
+      diffPatch || 'No worker file changes detected for this iteration.',
+      '',
+    ].join('\n'));
+  }
+
+  if (sections.length === 0) {
+    return 'No iteration diff artifacts were recorded for this run.\n';
+  }
+
+  return sections.join('\n');
+}
+
 function parseWorkerFooter(output) {
   const footer = {};
   const fields = [
@@ -1455,6 +2510,7 @@ function parseWorkerFooter(output) {
 }
 
 function writeLeanIterationArtifacts(iterationPaths, summary, diffPatch) {
+  fs.mkdirSync(iterationPaths.evidenceDir, { recursive: true });
   writeText(iterationPaths.stdoutLogPath, summary.stdout);
   writeText(iterationPaths.stderrLogPath, summary.stderr);
   writeText(iterationPaths.summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
@@ -1466,6 +2522,11 @@ function writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteratio
     return;
   }
 
+  const agent = normalizeQaAgentRoleForArtifact(
+    hasMeaningfulString(options.RALPH_AGENT)
+      ? options.RALPH_AGENT
+      : verifyResult && verifyResult.RALPH_AGENT,
+  );
   const runId = hasMeaningfulString(verifyResult && verifyResult.runId)
     ? verifyResult.runId
     : hasMeaningfulString(options.runId)
@@ -1475,6 +2536,7 @@ function writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteratio
     ? buildLeanValidationRecord(repoRoot, {
       ...verifyResult,
       runId,
+      RALPH_AGENT: agent,
     })
     : {
       status: 'skipped',
@@ -1490,6 +2552,9 @@ function writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteratio
     ...baseRecord,
     iteration,
   };
+  if (agent) {
+    validationRecord.RALPH_AGENT = agent;
+  }
   writeText(iterationPaths.validationPath, `${JSON.stringify(validationRecord, null, 2)}\n`);
 }
 
@@ -1501,12 +2566,92 @@ function readRequiredLeanArtifact(filePath, displayPath) {
   return readText(filePath);
 }
 
+function readLeanArtifactForWorkerPrompt(filePath, displayPath) {
+  if (!pathExists(filePath) || !fs.statSync(filePath).isFile()) {
+    return `Missing harness artifact: ${displayPath}.`;
+  }
+
+  return readText(filePath);
+}
+
+function replaceRunLocalSeedPlaceholders(content, seedSpecDisplayPath) {
+  return content.replaceAll(
+    `${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/<run-id>/${HARNESS_RUN_SEED_SPEC_FILE}`,
+    seedSpecDisplayPath,
+  );
+}
+
+function buildRunLocalCoverageArtifactPromptSection(options) {
+  if (options.role !== 'qa-executor') {
+    return [];
+  }
+
+  const repoRoot = options.repoRoot || process.cwd();
+  const runId = hasMeaningfulString(options.runId) ? options.runId : '<run-id>';
+  const seedSpecDisplayPath = hasMeaningfulString(options.seedSpecPath)
+    ? resolveDisplayPath(repoRoot, options.seedSpecPath)
+    : `${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/${runId}/${HARNESS_RUN_SEED_SPEC_FILE}`;
+  const playwrightConfigDisplayPath = hasMeaningfulString(options.playwrightConfigPath)
+    ? resolveDisplayPath(repoRoot, options.playwrightConfigPath)
+    : `${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/${runId}/${HARNESS_RUN_PLAYWRIGHT_CONFIG_FILE}`;
+
+  return [
+    '## Run-Local Coverage Artifacts',
+    '',
+    `- Seed spec: \`${seedSpecDisplayPath}\``,
+    `- Optional Playwright config: \`${playwrightConfigDisplayPath}\``,
+    '- The seed spec is the first executable coverage proof for this run.',
+    '- The seed spec imports Playwright test APIs from the target project dependencies.',
+    '- The seed spec contains working navigation, interactions, waits, assertions, and locators for the selected coverage flow.',
+    '- The seed is evidence, not final BDD output.',
+    '',
+  ];
+}
+
 function buildLeanWorkerPrompt(options) {
   const selectedItemBlock = options.selectedItem.block.trimEnd();
+  const role = assertValidQaAgentRole(options.role || 'qa-planner');
+  const templatePaths = resolveQaAgentTemplatePaths(role);
+  const runLocalCoverageArtifactSection = buildRunLocalCoverageArtifactPromptSection({
+    ...options,
+    role,
+  });
+  const seedSpecDisplayPath = hasMeaningfulString(options.seedSpecPath)
+    ? resolveDisplayPath(options.repoRoot || process.cwd(), options.seedSpecPath)
+    : `${HARNESS_DIR_NAME}/${HARNESS_RUNS_DIR}/${hasMeaningfulString(options.runId) ? options.runId : '<run-id>'}/${HARNESS_RUN_SEED_SPEC_FILE}`;
+  const roleAgentContent = replaceRunLocalSeedPlaceholders(readRequiredLeanArtifact(
+    templatePaths.agentPath,
+    formatQaAgentTemplateDisplayPath(templatePaths.agentPath),
+  ).trimEnd(), seedSpecDisplayPath);
+  const roleSkillsContent = replaceRunLocalSeedPlaceholders(readRequiredLeanArtifact(
+    templatePaths.skillsPath,
+    formatQaAgentTemplateDisplayPath(templatePaths.skillsPath),
+  ).trimEnd(), seedSpecDisplayPath);
 
   return [
     '# Copilot Worker Prompt',
     '',
+    `RALPH_AGENT: ${role}`,
+    '',
+    '## Orchestrator Route',
+    '',
+    `- Role: \`${role}\``,
+    `- Mode: \`${sanitizeInlineCode(options.mode || normalizeQaRouteMode(options.selectedItem, role))}\``,
+    `- Reason: ${sanitizeOptionalInlineCode(options.routeReason) || 'selected by orchestrator'}`,
+    '',
+    `## Role Agent Template: \`${formatQaAgentTemplateDisplayPath(templatePaths.agentPath)}\``,
+    '',
+    '```markdown',
+    roleAgentContent,
+    '```',
+    '',
+    `## Role Skills Template: \`${formatQaAgentTemplateDisplayPath(templatePaths.skillsPath)}\``,
+    '',
+    '```markdown',
+    roleSkillsContent,
+    '```',
+    '',
+    ...runLocalCoverageArtifactSection,
     '## Durable PRD: `.qa-harness/PRD.md`',
     '',
     '```markdown',
@@ -1541,29 +2686,54 @@ function buildLeanWorkerPrompt(options) {
   ].join('\n');
 }
 
-function writeLeanWorkerPrompt(runPaths, iteration) {
-  const prdContent = readRequiredLeanArtifact(runPaths.prdPath, `${HARNESS_DIR_NAME}/${HARNESS_PRD_FILE}`);
-  const progressContent = readRequiredLeanArtifact(runPaths.progressPath, `${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}`);
-  const promptContent = readRequiredLeanArtifact(runPaths.promptPath, `${HARNESS_DIR_NAME}/${HARNESS_PROMPT_FILE}`);
-  const selectedItem = findNextActionableProgressItem(progressContent);
+function writeLeanWorkerPrompt(runPaths, iteration, route) {
+  const prdContent = readLeanArtifactForWorkerPrompt(runPaths.prdPath, `${HARNESS_DIR_NAME}/${HARNESS_PRD_FILE}`);
+  const progressContent = readLeanArtifactForWorkerPrompt(
+    runPaths.progressPath,
+    `${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}`,
+  );
+  const promptContent = readLeanArtifactForWorkerPrompt(runPaths.promptPath, `${HARNESS_DIR_NAME}/${HARNESS_PROMPT_FILE}`);
+  const selectedRoute = route || selectQaOrchestratorRoute(runPaths);
+  const selectedItem = selectedRoute.item;
 
   if (!selectedItem) {
     throw new Error(`No unchecked actionable item found in ${HARNESS_DIR_NAME}/${HARNESS_PROGRESS_FILE}.`);
   }
 
   const iterationPaths = resolveLeanIterationPaths(runPaths, iteration);
+  fs.mkdirSync(iterationPaths.iterationDir, { recursive: true });
+  let selectedRole;
+  try {
+    selectedRole = assertValidQaAgentRole(selectedRoute.role);
+  } catch (error) {
+    if (isQaAgentRoleSelectionError(error)) {
+      error.iterationPaths = iterationPaths;
+      error.selectedItem = selectedItem;
+    }
+    throw error;
+  }
   const workerPrompt = buildLeanWorkerPrompt({
+    role: selectedRole,
+    mode: selectedRoute.mode,
+    routeReason: selectedRoute.reason,
+    repoRoot: runPaths.repoRoot,
+    runId: runPaths.runId,
+    seedSpecPath: runPaths.seedSpecPath,
+    playwrightConfigPath: runPaths.playwrightConfigPath,
     prdContent,
     progressContent,
     promptContent,
     selectedItem,
   });
-  fs.mkdirSync(iterationPaths.iterationDir, { recursive: true });
   writeText(iterationPaths.workerPromptPath, workerPrompt);
+  const resolvedPromptPath = writeLeanResolvedPromptAuditCopy(runPaths, iterationPaths, selectedRole, workerPrompt);
 
   return {
     ...iterationPaths,
+    resolvedPromptPath,
     selectedItem,
+    RALPH_AGENT: selectedRole,
+    mode: selectedRoute.mode,
     workerPrompt,
   };
 }
@@ -1593,6 +2763,29 @@ function isLeanSelectedProgressItemCompleted(runPaths, selectedItem) {
   const progressContent = readText(runPaths.progressPath);
   const item = findProgressItem(progressContent, (candidate) => candidate.id === selectedItem.id);
   return Boolean(item && item.checkboxChecked && item.status === 'pass');
+}
+
+function isLeanVerifierHandoffRoute(selectedAgent, selectedItem, route) {
+  return selectedAgent === 'qa-executor'
+    && selectedItem
+    && hasMeaningfulString(selectedItem.id)
+    && route
+    && route.status === 'run'
+    && route.role === 'qa-verifier'
+    && route.item
+    && route.item.id === selectedItem.id;
+}
+
+function isLeanVerifierHealingRoute(selectedAgent, selectedItem, route) {
+  return selectedAgent === 'qa-verifier'
+    && selectedItem
+    && hasMeaningfulString(selectedItem.id)
+    && route
+    && route.status === 'run'
+    && route.role === 'qa-executor'
+    && route.mode === 'healing'
+    && route.item
+    && route.item.id === selectedItem.id;
 }
 
 function finishLeanRun(harnessPaths, startedState, status, iterationCount, runId, iterations, options = {}) {
@@ -1631,7 +2824,9 @@ function runLeanSupervisorVerify(verifyFn, options) {
 function run(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
   const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
-  const maxIterations = parsePositiveIntegerOption(options.maxIterations, 'maxIterations');
+  const maxIterations = Object.prototype.hasOwnProperty.call(options, 'maxIterations')
+    ? parsePositiveIntegerOption(options.maxIterations, 'maxIterations')
+    : readConfiguredProductLoopDefaultMaxIterations(repoRoot) || DEFAULT_PRODUCT_MAX_ITERATIONS;
   const state = readHarnessState(harnessPaths);
 
   if (!state) {
@@ -1666,15 +2861,26 @@ function run(options = {}) {
   writeHarnessState(harnessPaths, startedState);
 
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
-    if (!hasLeanActionableProgressItem(runPaths)) {
+    let route;
+    try {
+      route = selectQaOrchestratorRoute(runPaths);
+    } catch (error) {
+      if (!isQaAgentRoleSelectionError(error)) {
+        throw error;
+      }
+
+      route = null;
+    }
+
+    if (route && route.stopReason) {
       return finishLeanRun(
         harnessPaths,
         startedState,
-        'completed',
+        route.status,
         iterations.length,
         runId,
         iterations,
-        { stopReason: 'no-actionable-items' },
+        { stopReason: route.stopReason },
       );
     }
 
@@ -1682,17 +2888,29 @@ function run(options = {}) {
     let iterationPrompt;
     let iterationPaths;
     let beforeSnapshot;
+    let roleSelectionError = null;
+    let selectedAgent = 'qa-orchestrator';
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     try {
-      iterationPrompt = writeLeanWorkerPrompt(runPaths, iteration);
+      iterationPrompt = writeLeanWorkerPrompt(runPaths, iteration, route);
       iterationPaths = iterationPrompt;
+      selectedAgent = iterationPrompt.RALPH_AGENT;
       beforeSnapshot = captureIterationSnapshot(repoRoot);
       commandResult = normalizeWorkerCommandResult(commandRunner(copilotCommand, [], repoRoot, {
         env,
         input: iterationPrompt.workerPrompt,
       }));
     } catch (error) {
+      if (isQaAgentRoleSelectionError(error)) {
+        roleSelectionError = error;
+        iterationPaths = error.iterationPaths || resolveLeanIterationPaths(runPaths, iteration);
+        fs.mkdirSync(iterationPaths.iterationDir, { recursive: true });
+        iterationPrompt = {
+          selectedItem: error.selectedItem,
+          RALPH_AGENT: selectedAgent,
+        };
+      }
       commandResult = {
         exitCode: 1,
         stdout: '',
@@ -1704,12 +2922,43 @@ function run(options = {}) {
     const afterSnapshot = beforeSnapshot ? captureIterationSnapshot(repoRoot) : new Map();
     const changes = beforeSnapshot ? compareIterationSnapshots(beforeSnapshot, afterSnapshot) : [];
     const changedFiles = formatChangedFiles(changes);
-    const parsedFooter = parseWorkerFooter(`${commandResult.stdout}\n${commandResult.stderr}`);
+    const coverageEvidence = selectedAgent === 'qa-executor'
+      ? recordCoveragePlaywrightCliSeedEvidence(repoRoot, runPaths, iterationPaths, iteration, {
+        commandRunner,
+        env,
+      })
+      : null;
+    const currentProgressItem = readCurrentProgressItem(
+      runPaths,
+      iterationPrompt && iterationPrompt.selectedItem,
+    );
+    const coverageEvidenceFailure = selectedAgent === 'qa-executor'
+      ? assessCoverageMcpFallbackUse(
+        runPaths,
+        coverageEvidence,
+        currentProgressItem,
+        `${commandResult.stdout}\n${commandResult.stderr}`,
+        iterationPrompt && iterationPrompt.selectedItem,
+      )
+        || assessCoveragePromotionUse(
+          runPaths,
+          coverageEvidence,
+          currentProgressItem,
+          `${commandResult.stdout}\n${commandResult.stderr}`,
+          iterationPrompt && iterationPrompt.selectedItem,
+          changes,
+        )
+      : null;
+    const coverageEvidenceError = coverageEvidenceFailure ? coverageEvidenceFailure.reason : null;
+    const parsedFooter = roleSelectionError
+      ? { footer: {}, error: null }
+      : parseWorkerFooter(`${commandResult.stdout}\n${commandResult.stderr}`);
     const footer = parsedFooter.footer;
     const footerError = parsedFooter.error;
     const durationMs = Math.max(0, finishedAtMs - startedAtMs);
     const iterationSummary = {
       iteration,
+      RALPH_AGENT: selectedAgent,
       command: copilotCommand,
       args: [],
       exitCode: commandResult.exitCode,
@@ -1719,8 +2968,18 @@ function run(options = {}) {
       stdout: commandResult.stdout,
       stderr: commandResult.stderr,
       changedFiles,
+      coverageEvidence: coverageEvidence
+        ? {
+          path: coverageEvidence.path,
+          commandDisplay: coverageEvidence.record.commandDisplay,
+          exitCode: coverageEvidence.record.exitCode,
+          durationMs: coverageEvidence.record.durationMs,
+        }
+        : null,
+      coverageEvidenceError,
       footer,
       footerError,
+      roleError: roleSelectionError ? roleSelectionError.message : null,
     };
 
     if (iterationPaths) {
@@ -1734,18 +2993,47 @@ function run(options = {}) {
     iterations.push({
       iteration,
       command: copilotCommand,
+      RALPH_AGENT: selectedAgent,
       exitCode: commandResult.exitCode,
       stdout: commandResult.stdout,
       stderr: commandResult.stderr,
       durationMs,
       changedFiles,
+      coverageEvidence: coverageEvidence
+        ? {
+          path: coverageEvidence.path,
+          commandDisplay: coverageEvidence.record.commandDisplay,
+          exitCode: coverageEvidence.record.exitCode,
+          durationMs: coverageEvidence.record.durationMs,
+        }
+        : null,
+      coverageEvidenceError,
       footer,
       footerError,
+      roleError: roleSelectionError ? roleSelectionError.message : null,
     });
+
+    if (roleSelectionError) {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        RALPH_AGENT: selectedAgent,
+        reason: roleSelectionError.message,
+      });
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: 'invalid-agent-role' },
+      );
+    }
 
     if (footerError) {
       writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
         runId,
+        RALPH_AGENT: selectedAgent,
         reason: footerError,
       });
       return finishLeanRun(
@@ -1762,6 +3050,7 @@ function run(options = {}) {
     if (commandResult.exitCode !== 0) {
       writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
         runId,
+        RALPH_AGENT: selectedAgent,
         reason: `Worker exited nonzero before supervisor verification: ${commandResult.exitCode}.`,
       });
       return finishLeanRun(
@@ -1775,9 +3064,33 @@ function run(options = {}) {
       );
     }
 
+    if (coverageEvidenceError) {
+      writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
+        runId,
+        RALPH_AGENT: selectedAgent,
+        reason: coverageEvidenceError,
+      });
+      updateLeanSelectedProgressItem(
+        runPaths,
+        iterationPrompt && iterationPrompt.selectedItem,
+        'fail',
+        `fail: ${coverageEvidenceError}`,
+      );
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        'failed',
+        iteration,
+        runId,
+        iterations,
+        { stopReason: coverageEvidenceFailure.stopReason },
+      );
+    }
+
     if (footer.status === 'fail') {
       writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
         runId,
+        RALPH_AGENT: selectedAgent,
         reason: 'Worker reported RALPH_STATUS: fail, so supervisor verification was not run.',
       });
       updateLeanSelectedProgressItem(
@@ -1786,6 +3099,27 @@ function run(options = {}) {
         'fail',
         `fail: ${footer.summary}`,
       );
+      const postFailRoute = selectQaOrchestratorRoute(runPaths);
+      if (isLeanVerifierHealingRoute(
+        selectedAgent,
+        iterationPrompt && iterationPrompt.selectedItem,
+        postFailRoute,
+      )) {
+        continue;
+      }
+
+      if (selectedAgent === 'qa-verifier' && postFailRoute.stopReason) {
+        return finishLeanRun(
+          harnessPaths,
+          startedState,
+          postFailRoute.status,
+          iteration,
+          runId,
+          iterations,
+          { stopReason: postFailRoute.stopReason },
+        );
+      }
+
       return finishLeanRun(
         harnessPaths,
         startedState,
@@ -1800,6 +3134,7 @@ function run(options = {}) {
     if (footer.status === 'blocked') {
       writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, null, {
         runId,
+        RALPH_AGENT: selectedAgent,
         reason: 'Worker reported RALPH_STATUS: blocked, so supervisor verification was not run.',
       });
       updateLeanSelectedProgressItem(
@@ -1826,7 +3161,10 @@ function run(options = {}) {
       commandRunner,
       env,
     });
-    writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, verifyResult, { runId });
+    writeLeanIterationValidationArtifact(repoRoot, iterationPaths, iteration, verifyResult, {
+      runId,
+      RALPH_AGENT: selectedAgent,
+    });
 
     if (!verifyResult || verifyResult.status !== 'pass') {
       updateLeanSelectedProgressItem(
@@ -1835,6 +3173,27 @@ function run(options = {}) {
         'fail',
         `fail: ${footer.summary}; supervisor verify failed`,
       );
+      const postValidationFailRoute = selectQaOrchestratorRoute(runPaths);
+      if (isLeanVerifierHealingRoute(
+        selectedAgent,
+        iterationPrompt && iterationPrompt.selectedItem,
+        postValidationFailRoute,
+      )) {
+        continue;
+      }
+
+      if (selectedAgent === 'qa-verifier' && postValidationFailRoute.stopReason) {
+        return finishLeanRun(
+          harnessPaths,
+          startedState,
+          postValidationFailRoute.status,
+          iteration,
+          runId,
+          iterations,
+          { stopReason: postValidationFailRoute.stopReason },
+        );
+      }
+
       return finishLeanRun(
         harnessPaths,
         startedState,
@@ -1846,12 +3205,63 @@ function run(options = {}) {
       );
     }
 
+    const postVerifyRoute = selectQaOrchestratorRoute(runPaths);
+    if (isLeanVerifierHandoffRoute(
+      selectedAgent,
+      iterationPrompt && iterationPrompt.selectedItem,
+      postVerifyRoute,
+    )) {
+      continue;
+    }
+
+    if (selectedAgent === 'qa-executor') {
+      updateLeanSelectedProgressItem(
+        runPaths,
+        iterationPrompt && iterationPrompt.selectedItem,
+        'needs-verification',
+        `needs-verification: ${footer.summary}; supervisor verify passed`,
+      );
+      const postExecutorPassRoute = selectQaOrchestratorRoute(runPaths);
+      if (isLeanVerifierHandoffRoute(
+        selectedAgent,
+        iterationPrompt && iterationPrompt.selectedItem,
+        postExecutorPassRoute,
+      )) {
+        continue;
+      }
+
+      if (postExecutorPassRoute.stopReason) {
+        return finishLeanRun(
+          harnessPaths,
+          startedState,
+          postExecutorPassRoute.status,
+          iteration,
+          runId,
+          iterations,
+          { stopReason: postExecutorPassRoute.stopReason },
+        );
+      }
+    }
+
     updateLeanSelectedProgressItem(
       runPaths,
       iterationPrompt && iterationPrompt.selectedItem,
       'pass',
       `pass: ${footer.summary}; supervisor verify passed`,
     );
+    const postPassRoute = selectQaOrchestratorRoute(runPaths);
+    if (postPassRoute.stopReason) {
+      return finishLeanRun(
+        harnessPaths,
+        startedState,
+        postPassRoute.status,
+        iteration,
+        runId,
+        iterations,
+        { stopReason: postPassRoute.stopReason },
+      );
+    }
+
     if (!isLeanSelectedProgressItemCompleted(runPaths, iterationPrompt && iterationPrompt.selectedItem)) {
       return finishLeanRun(
         harnessPaths,
@@ -1913,6 +3323,489 @@ function runCapturedValidationCommand(command, args, repoRoot, options = {}) {
   }
 }
 
+function runCapturedEvidenceCommand(command, args, repoRoot, options = {}) {
+  const commandRunner = options.commandRunner || runCommand;
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+
+  try {
+    const result = commandRunner(command, args, repoRoot, { env: options.env || process.env });
+    const finishedAtMs = Date.now();
+    return {
+      command,
+      args: Array.isArray(args) ? [...args] : [],
+      commandDisplay: result && result.commandDisplay
+        ? result.commandDisplay
+        : formatCommandDisplay(command, args),
+      exitCode: normalizeCommandExitCode(result),
+      stdout: result && typeof result.stdout === 'string' ? result.stdout : '',
+      stderr: result && typeof result.stderr === 'string' ? result.stderr : '',
+      startedAt,
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: Math.max(0, finishedAtMs - startedAtMs),
+    };
+  } catch (error) {
+    const finishedAtMs = Date.now();
+    return {
+      command,
+      args: Array.isArray(args) ? [...args] : [],
+      commandDisplay: formatCommandDisplay(command, args),
+      exitCode: 1,
+      stdout: '',
+      stderr: error instanceof Error ? error.message : String(error),
+      startedAt,
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: Math.max(0, finishedAtMs - startedAtMs),
+    };
+  }
+}
+
+function recordCoveragePlaywrightCliSeedEvidence(repoRoot, runPaths, iterationPaths, iteration, options = {}) {
+  if (
+    !runPaths
+    || !iterationPaths
+    || !hasMeaningfulString(runPaths.seedSpecPath)
+    || !pathExists(runPaths.seedSpecPath)
+  ) {
+    return null;
+  }
+
+  const seedSpecDisplayPath = normalizeDisplayPath(path.relative(repoRoot, runPaths.seedSpecPath));
+  const command = getNpxCommand();
+  const args = ['playwright', 'test', seedSpecDisplayPath];
+  const commandResult = runCapturedEvidenceCommand(command, args, repoRoot, {
+    commandRunner: options.commandRunner,
+    env: options.env,
+  });
+  const record = {
+    type: 'playwright-cli-seed',
+    RALPH_AGENT: 'qa-executor',
+    runId: runPaths.runId,
+    iteration,
+    seedSpecPath: seedSpecDisplayPath,
+    ...commandResult,
+  };
+
+  fs.mkdirSync(iterationPaths.evidenceDir, { recursive: true });
+  writeText(iterationPaths.coveragePlaywrightCliEvidencePath, `${JSON.stringify(record, null, 2)}\n`);
+  return {
+    path: normalizeDisplayPath(path.relative(repoRoot, iterationPaths.coveragePlaywrightCliEvidencePath)),
+    record,
+  };
+}
+
+function hasRecordedCoveragePlaywrightCliEvidence(runPaths, currentEvidence) {
+  if (currentEvidence) {
+    return true;
+  }
+
+  if (!runPaths || !pathExists(runPaths.iterationsDir)) {
+    return false;
+  }
+
+  for (const entry of fs.readdirSync(runPaths.iterationsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const evidencePath = path.join(
+      runPaths.iterationsDir,
+      entry.name,
+      HARNESS_ITERATION_EVIDENCE_DIR,
+      HARNESS_COVERAGE_PLAYWRIGHT_CLI_EVIDENCE_FILE,
+    );
+    if (pathExists(evidencePath)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function readCoveragePlaywrightCliEvidenceRecords(runPaths, currentEvidence) {
+  const records = [];
+
+  if (currentEvidence && currentEvidence.record) {
+    records.push(currentEvidence.record);
+  }
+
+  if (!runPaths || !pathExists(runPaths.iterationsDir)) {
+    return records;
+  }
+
+  for (const entry of fs.readdirSync(runPaths.iterationsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const evidencePath = path.join(
+      runPaths.iterationsDir,
+      entry.name,
+      HARNESS_ITERATION_EVIDENCE_DIR,
+      HARNESS_COVERAGE_PLAYWRIGHT_CLI_EVIDENCE_FILE,
+    );
+    if (!pathExists(evidencePath)) {
+      continue;
+    }
+
+    try {
+      records.push(JSON.parse(readText(evidencePath)));
+    } catch (_error) {
+      records.push({
+        type: 'playwright-cli-seed',
+        exitCode: 1,
+        parseError: `Unable to parse ${HARNESS_COVERAGE_PLAYWRIGHT_CLI_EVIDENCE_FILE}.`,
+      });
+    }
+  }
+
+  return records;
+}
+
+function hasFailedCoveragePlaywrightCliEvidence(records) {
+  return records.some((record) => Number(record && record.exitCode) !== 0);
+}
+
+function readCoverageVerificationProgressItems(harnessPaths) {
+  if (!harnessPaths || !pathExists(harnessPaths.progressPath)) {
+    return [];
+  }
+
+  return parseProgressItems(readText(harnessPaths.progressPath));
+}
+
+function progressItemLooksCoverageScoped(item) {
+  const values = [
+    item && item.goal,
+    item && item.input,
+    item && item.output,
+    item && item.verify,
+    item && item.result,
+    item && item.evidence,
+    item && item.fallbackReason,
+  ];
+
+  return values.some((value) =>
+    /\b(?:coverage|seed proof|seed evidence|MCP fallback|full Playwright execution)\b/i.test(value || ''));
+}
+
+function isCoverageVerificationRequired(repoRoot, harnessPaths, runId) {
+  if (!hasMeaningfulString(runId)) {
+    return false;
+  }
+
+  const state = readHarnessState(harnessPaths);
+  if (state && state.intake && state.intake.kind === 'coverage-request') {
+    return true;
+  }
+
+  if (harnessPaths && pathExists(harnessPaths.prdPath)) {
+    const prdContent = readText(harnessPaths.prdPath);
+    if (/##\s+Accepted Coverage Request\b/i.test(prdContent) || parseRunIntent(prdContent) === 'coverage') {
+      return true;
+    }
+  }
+
+  return readCoverageVerificationProgressItems(harnessPaths).some(progressItemLooksCoverageScoped);
+}
+
+function isValidCoveragePlaywrightCliSeedEvidenceRecord(record, runId, seedSpecDisplayPath) {
+  if (!record || typeof record !== 'object') {
+    return false;
+  }
+
+  if (record.type !== 'playwright-cli-seed') {
+    return false;
+  }
+
+  if (record.RALPH_AGENT !== 'qa-executor') {
+    return false;
+  }
+
+  if (record.runId !== runId || record.seedSpecPath !== seedSpecDisplayPath) {
+    return false;
+  }
+
+  const commandName = hasMeaningfulString(record.command) ? path.basename(record.command).toLowerCase() : '';
+  if (commandName && commandName !== 'npx' && commandName !== 'npx.cmd') {
+    return false;
+  }
+
+  if (!Array.isArray(record.args) || record.args.length !== 3) {
+    return false;
+  }
+
+  const [tool, subcommand, seedPath] = record.args;
+  return tool === 'playwright' && subcommand === 'test' && seedPath === seedSpecDisplayPath;
+}
+
+function buildCoverageProofStatus(overrides = {}) {
+  return {
+    required: true,
+    seedProofStatus: overrides.seedProofStatus || 'unknown',
+    mcpFallbackStatus: overrides.mcpFallbackStatus || 'not-used',
+    fullExecutionStatus: overrides.fullExecutionStatus || 'pending',
+    ...overrides,
+  };
+}
+
+function assessCoverageVerifierPrerequisites(repoRoot, harnessPaths, runId) {
+  if (!isCoverageVerificationRequired(repoRoot, harnessPaths, runId)) {
+    return { required: false };
+  }
+
+  const runPaths = resolveHarnessPaths(repoRoot, { runId });
+  const seedSpecDisplayPath = `.qa-harness/runs/${runId}/seed.spec.ts`;
+  const records = readCoveragePlaywrightCliEvidenceRecords(runPaths, null);
+  const proof = buildCoverageProofStatus({
+    seedSpecPath: seedSpecDisplayPath,
+    seedEvidenceCount: records.length,
+  });
+
+  if (!pathExists(runPaths.seedSpecPath) || records.length === 0) {
+    proof.seedProofStatus = 'missing';
+    return {
+      proof,
+      error: `Playwright CLI seed proof is required for coverage verification for run ${runId}.`,
+    };
+  }
+
+  const validSeedRecord = records.find((record) =>
+    isValidCoveragePlaywrightCliSeedEvidenceRecord(record, runId, seedSpecDisplayPath));
+  if (!validSeedRecord) {
+    proof.seedProofStatus = 'invalid-cli';
+    return {
+      proof,
+      error: `Coverage seed proof must be executed by Playwright CLI for run ${runId}.`,
+    };
+  }
+
+  proof.seedProofStatus = Number(validSeedRecord.exitCode) === 0 ? 'pass' : 'failed';
+  proof.seedEvidenceExitCode = Number(validSeedRecord.exitCode);
+
+  for (const progressItem of readCoverageVerificationProgressItems(harnessPaths)) {
+    if (!hasMcpFallbackUse(progressItem, '')) {
+      continue;
+    }
+
+    const fallbackFailure = assessCoverageMcpFallbackUse(runPaths, null, progressItem, '', progressItem);
+    if (fallbackFailure) {
+      proof.mcpFallbackStatus = 'fail';
+      return {
+        proof,
+        error: fallbackFailure.reason,
+      };
+    }
+
+    proof.mcpFallbackStatus = 'pass';
+  }
+
+  if (proof.seedProofStatus === 'failed' && proof.mcpFallbackStatus !== 'pass') {
+    return {
+      proof,
+      error: `Playwright CLI seed proof failed before coverage verification for run ${runId}; record MCP fallback reason and evidence or rerun seed proof successfully.`,
+    };
+  }
+
+  return { proof };
+}
+
+function readCurrentProgressItem(runPaths, selectedItem) {
+  if (!runPaths || !selectedItem || !hasMeaningfulString(selectedItem.id) || !pathExists(runPaths.progressPath)) {
+    return selectedItem || null;
+  }
+
+  const progressContent = readText(runPaths.progressPath);
+  return findProgressItem(progressContent, (candidate) => candidate.id === selectedItem.id) || selectedItem;
+}
+
+function hasMcpFallbackUse(progressItem, workerOutput) {
+  const values = [
+    progressItem && progressItem.fallbackReason,
+    progressItem && progressItem.evidence,
+    workerOutput,
+  ];
+
+  return values.some((value) => /\bMCP\b/i.test(value || ''));
+}
+
+function hasMcpFallbackEvidence(progressItem) {
+  const evidence = progressItem && progressItem.evidence;
+  if (!hasMeaningfulString(evidence)) {
+    return false;
+  }
+
+  return /\b(?:MCP|accessibility snapshot|observed element|observed name|element name|interaction notes?|interaction log|snapshot)\b/i
+    .test(evidence);
+}
+
+function assessCoverageMcpFallbackUse(runPaths, currentEvidence, progressItem, workerOutput, selectedItem) {
+  if (!hasMcpFallbackUse(progressItem, workerOutput)) {
+    return null;
+  }
+
+  const itemId = selectedItem && selectedItem.id ? selectedItem.id : 'unknown';
+  const evidenceRecords = readCoveragePlaywrightCliEvidenceRecords(runPaths, currentEvidence);
+  if (evidenceRecords.length === 0) {
+    return {
+      stopReason: 'coverage-cli-evidence-required',
+      reason: `Playwright CLI seed evidence is required before MCP fallback for progress item ${itemId}.`,
+    };
+  }
+
+  if (!hasFailedCoveragePlaywrightCliEvidence(evidenceRecords)) {
+    return {
+      stopReason: 'coverage-mcp-fallback-requires-failed-cli',
+      reason: `MCP fallback requires Playwright CLI seed evidence that could not proceed for progress item ${itemId}.`,
+    };
+  }
+
+  if (!hasMeaningfulString(progressItem && progressItem.fallbackReason)) {
+    return {
+      stopReason: 'coverage-mcp-fallback-reason-required',
+      reason: `MCP fallback requires a fallback reason for progress item ${itemId}.`,
+    };
+  }
+
+  if (!hasMcpFallbackEvidence(progressItem)) {
+    return {
+      stopReason: 'coverage-mcp-fallback-evidence-required',
+      reason: `MCP fallback requires MCP evidence for progress item ${itemId}.`,
+    };
+  }
+
+  return null;
+}
+
+function isCoveragePromotionTargetPath(filePath) {
+  return /^(?:Features\/.+\.feature|Features\/steps\/.+\.(?:js|jsx|ts|tsx))$/i.test(filePath || '');
+}
+
+function getCoveragePromotionTargetChanges(changes) {
+  if (!Array.isArray(changes)) {
+    return [];
+  }
+
+  return changes.filter((change) => isCoveragePromotionTargetPath(change && change.path));
+}
+
+function hasCoveragePromotionClaim(progressItem, workerOutput, targetChanges) {
+  const values = [
+    progressItem && progressItem.result,
+    progressItem && progressItem.evidence,
+    progressItem && progressItem.promotionExplanation,
+    workerOutput,
+  ];
+
+  if (values.some((value) => /\bpromot(?:e|ed|es|ing|ion)\b/i.test(value || ''))) {
+    return true;
+  }
+
+  return getCoveragePromotionTargetChanges(targetChanges).length > 0
+    && values.some((value) => /\b(?:BDD|framework|steps?|feature file)\b/i.test(value || ''));
+}
+
+function extractQuotedPromotionValues(content) {
+  const values = [];
+  const pattern = /(['"`])((?:\\.|(?!\1)[\s\S])*)\1/g;
+  let match;
+
+  while ((match = pattern.exec(content || '')) !== null) {
+    const value = match[2].trim();
+    if (
+      value.length >= 3
+      && !/^[@A-Za-z0-9_-]+(?:\/[@A-Za-z0-9_.-]+)+$/.test(value)
+      && !/^(?:test|expect|Given|When|Then)$/i.test(value)
+    ) {
+      values.push(value.toLowerCase());
+    }
+  }
+
+  return values;
+}
+
+function promotionEvidenceClaimsMaterialDifference(progressItem, workerOutput) {
+  const values = [
+    progressItem && progressItem.result,
+    progressItem && progressItem.evidence,
+    progressItem && progressItem.promotionExplanation,
+    workerOutput,
+  ];
+
+  return values.some((value) => /\bmaterial(?:ly)? differ(?:s|ed|ent|ence)?\b|\bdiffer(?:s|ed)? from seed\b/i
+    .test(value || ''));
+}
+
+function promotionTargetMateriallyDiffersFromSeed(runPaths, targetChanges, progressItem, workerOutput) {
+  if (promotionEvidenceClaimsMaterialDifference(progressItem, workerOutput)) {
+    return true;
+  }
+
+  if (!runPaths || !hasMeaningfulString(runPaths.seedSpecPath) || !pathExists(runPaths.seedSpecPath)) {
+    return false;
+  }
+
+  const seedValues = extractQuotedPromotionValues(readText(runPaths.seedSpecPath));
+  if (seedValues.length === 0) {
+    return false;
+  }
+
+  return targetChanges.some((change) => {
+    if (!change || !change.after || change.after.kind !== 'text') {
+      return false;
+    }
+
+    const promotedValues = new Set(extractQuotedPromotionValues(change.after.content));
+    return !seedValues.some((value) => promotedValues.has(value));
+  });
+}
+
+function hasCoveragePromotionDifferenceExplanation(progressItem) {
+  if (!progressItem) {
+    return false;
+  }
+
+  const explicitExplanation = progressItem.promotionExplanation;
+  if (hasMeaningfulString(explicitExplanation)) {
+    return true;
+  }
+
+  const values = [
+    progressItem.result,
+    progressItem.evidence,
+  ];
+
+  return values.some((value) => /\b(?:promotion explanation|because|explained by|reason:)\b/i.test(value || ''));
+}
+
+function assessCoveragePromotionUse(runPaths, currentEvidence, progressItem, workerOutput, selectedItem, changes) {
+  const targetChanges = getCoveragePromotionTargetChanges(changes);
+  if (!hasCoveragePromotionClaim(progressItem, workerOutput, targetChanges)) {
+    return null;
+  }
+
+  const itemId = selectedItem && selectedItem.id ? selectedItem.id : 'unknown';
+  if (!hasRecordedCoveragePlaywrightCliEvidence(runPaths, currentEvidence)) {
+    return {
+      stopReason: 'coverage-promotion-seed-proof-required',
+      reason: `Playwright CLI seed proof is required before promotion for progress item ${itemId}.`,
+    };
+  }
+
+  if (
+    targetChanges.length > 0
+    && promotionTargetMateriallyDiffersFromSeed(runPaths, targetChanges, progressItem, workerOutput)
+    && !hasCoveragePromotionDifferenceExplanation(progressItem)
+  ) {
+    return {
+      stopReason: 'coverage-promotion-explanation-required',
+      reason: `Promotion explanation is required when BDD or framework code materially differs from seed proof for progress item ${itemId}.`,
+    };
+  }
+
+  return null;
+}
+
 function buildLeanVerifyOutput(status, summary, commandResults) {
   const results = Array.isArray(commandResults) ? commandResults : [commandResults];
   const lines = [
@@ -1954,16 +3847,32 @@ function resolveVerifyRunId(harnessPaths, options = {}) {
 
 function buildLeanValidationRecord(repoRoot, result) {
   const generatedSpecs = Array.isArray(result.generatedSpecs) ? result.generatedSpecs : [];
-  return {
+  const agent = normalizeQaAgentRoleForArtifact(result.RALPH_AGENT);
+  const record = {
     status: result.status,
     runId: result.runId || '',
     exitCode: Number.isInteger(result.exitCode) ? result.exitCode : result.status === 'pass' ? 0 : 1,
     exportedStepCount: Number.isInteger(result.exportedStepCount) ? result.exportedStepCount : null,
     listedTestCount: Number.isInteger(result.listedTestCount) ? result.listedTestCount : null,
+    executedTestCount: Number.isInteger(result.executedTestCount) ? result.executedTestCount : null,
     generatedSpecs: generatedSpecs.map((generatedSpec) =>
       normalizeDisplayPath(path.relative(repoRoot, generatedSpec))),
     commands: Array.isArray(result.commands) ? result.commands : [],
   };
+
+  if (agent) {
+    record.RALPH_AGENT = agent;
+  }
+
+  if (result.coverageProof && result.coverageProof.required) {
+    record.coverageProof = result.coverageProof;
+  }
+
+  if (hasMeaningfulString(result.coverageProofError)) {
+    record.coverageProofError = result.coverageProofError;
+  }
+
+  return record;
 }
 
 function recordLeanValidationIfRunExists(repoRoot, result) {
@@ -1984,7 +3893,32 @@ function verify(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
   const harnessPaths = options.harnessPaths || resolveHarnessPaths(repoRoot);
   const runId = resolveVerifyRunId(harnessPaths, options);
-  const finish = (result) => recordLeanValidationIfRunExists(repoRoot, result);
+  const coverageAssessment = assessCoverageVerifierPrerequisites(repoRoot, harnessPaths, runId);
+  const coverageProof = coverageAssessment.proof || { required: false };
+  const finish = (result) => {
+    if (coverageProof.required && !result.coverageProof) {
+      result.coverageProof = coverageProof;
+    }
+    return recordLeanValidationIfRunExists(repoRoot, result);
+  };
+
+  if (coverageAssessment.error) {
+    return finish({
+      status: 'fail',
+      exitCode: 1,
+      harnessPaths,
+      commands: [],
+      exportedStepCount: null,
+      listedTestCount: null,
+      executedTestCount: null,
+      runId,
+      generatedSpecs: [],
+      coverageProof,
+      coverageProofError: coverageAssessment.error,
+      output: buildLeanVerifyOutput('fail', coverageAssessment.error, []),
+    });
+  }
+
   const exportCommand = runCapturedValidationCommand(getNpxCommand(), ['bddgen', 'export'], repoRoot, {
     commandRunner: options.commandRunner,
     env: options.env,
@@ -2056,6 +3990,7 @@ function verify(options = {}) {
   }
 
   let listedTestCount;
+  let executedTestCount;
   if (runId && generatedSpecs.length > 0) {
     const generatedSpecArgs = generatedSpecs.map((generatedSpec) =>
       normalizeDisplayPath(path.relative(repoRoot, generatedSpec)));
@@ -2099,6 +4034,64 @@ function verify(options = {}) {
         output: buildLeanVerifyOutput('fail', summary, commands),
       });
     }
+
+    const executionCommand = runCapturedValidationCommand(
+      getNpxCommand(),
+      ['playwright', 'test', ...generatedSpecArgs],
+      repoRoot,
+      {
+        commandRunner: options.commandRunner,
+        env: options.env,
+      },
+    );
+    commands.push(executionCommand);
+
+    executedTestCount = parseExecutedTestCount(`${executionCommand.stdout}\n${executionCommand.stderr}`);
+    if (executionCommand.exitCode !== 0) {
+      if (coverageProof.required) {
+        coverageProof.fullExecutionStatus = 'fail';
+      }
+      const summary = `playwright test failed with exit code ${executionCommand.exitCode}.`;
+      return finish({
+        status: 'fail',
+        exitCode: 1,
+        harnessPaths,
+        commands,
+        exportedStepCount,
+        listedTestCount,
+        executedTestCount,
+        runId,
+        generatedSpecs,
+        output: buildLeanVerifyOutput('fail', summary, commands),
+      });
+    }
+
+    if (coverageProof.required && executedTestCount < 1) {
+      coverageProof.fullExecutionStatus = 'fail';
+      const summary = `playwright test execution did not report executed tests for run ${runId}.`;
+      return finish({
+        status: 'fail',
+        exitCode: 1,
+        harnessPaths,
+        commands,
+        exportedStepCount,
+        listedTestCount,
+        executedTestCount,
+        runId,
+        generatedSpecs,
+        coverageProof,
+        coverageProofError: summary,
+        output: buildLeanVerifyOutput('fail', summary, commands),
+      });
+    }
+
+    if (executedTestCount < 1) {
+      executedTestCount = listedTestCount;
+    }
+
+    if (coverageProof.required) {
+      coverageProof.fullExecutionStatus = 'pass';
+    }
   }
 
   const stepLabel = `${exportedStepCount} step${exportedStepCount === 1 ? '' : 's'}`;
@@ -2108,13 +4101,17 @@ function verify(options = {}) {
   const listLabel = listedTestCount == null
     ? 'playwright test --list skipped because no run-backed specs exist'
     : `playwright test --list found ${listedTestCount} test${listedTestCount === 1 ? '' : 's'}`;
-  const summary = `bddgen export registered ${stepLabel}; bddgen test generated ${specLabel}; ${listLabel}.`;
+  const executionLabel = executedTestCount == null
+    ? 'playwright test execution skipped because no run-backed specs exist'
+    : `playwright test executed ${executedTestCount} test${executedTestCount === 1 ? '' : 's'}`;
+  const summary = `bddgen export registered ${stepLabel}; bddgen test generated ${specLabel}; ${listLabel}; ${executionLabel}.`;
   return finish({
     status: 'pass',
     harnessPaths,
     commands,
     exportedStepCount,
     listedTestCount,
+    executedTestCount,
     runId,
     generatedSpecs,
     output: buildLeanVerifyOutput('pass', summary, commands),
@@ -4166,6 +6163,28 @@ function parseListedTestCount(output) {
     .length;
 }
 
+function parseExecutedTestCount(output) {
+  const text = String(output || '');
+  const statusPattern = /(\d+)\s+(?:passed|failed|flaky|skipped|timed out|interrupted)\b/gi;
+  let total = 0;
+  let match;
+
+  while ((match = statusPattern.exec(text)) !== null) {
+    total += Number.parseInt(match[1], 10);
+  }
+
+  if (total > 0) {
+    return total;
+  }
+
+  const runningMatch = text.match(/Running\s+(\d+)\s+tests?/i);
+  if (runningMatch) {
+    return Number.parseInt(runningMatch[1], 10);
+  }
+
+  return 0;
+}
+
 function walkFiles(rootDir) {
   if (!pathExists(rootDir)) {
     return [];
@@ -4617,6 +6636,14 @@ function readProgressItemField(block, label) {
   return match ? match[1].trim() : '';
 }
 
+function progressItemHasField(block, label) {
+  return new RegExp(`^  - ${escapeForRegExp(label)}:\\s*.*$`, 'm').test(block);
+}
+
+function stripProgressInlineCode(value) {
+  return value.replace(/^`|`$/g, '');
+}
+
 function normalizeProgressStatus(status, checkboxChecked) {
   if (typeof status === 'string' && status.trim()) {
     return status.trim().toLowerCase();
@@ -4643,12 +6670,16 @@ function parseProgressItemBlock(block, location = {}) {
     input: readProgressItemField(block, 'Input'),
     output: readProgressItemField(block, 'Output'),
     verify: readProgressItemField(block, 'Verify'),
-    owner: readProgressItemField(block, 'Owner').replace(/^`|`$/g, ''),
+    owner: stripProgressInlineCode(readProgressItemField(block, 'Owner')),
+    agent: stripProgressInlineCode(readProgressItemField(block, 'Agent')),
+    mode: stripProgressInlineCode(readProgressItemField(block, 'Mode')),
     status,
-    retryBudget: readProgressItemField(block, 'Retry budget').replace(/^`|`$/g, ''),
-    result: readProgressItemField(block, 'Result').replace(/^`|`$/g, ''),
-    fallbackReason: readProgressItemField(block, 'Fallback reason').replace(/^`|`$/g, ''),
-    blockReason: readProgressItemField(block, 'Block reason').replace(/^`|`$/g, ''),
+    retryBudget: stripProgressInlineCode(readProgressItemField(block, 'Retry budget')),
+    result: stripProgressInlineCode(readProgressItemField(block, 'Result')),
+    evidence: stripProgressInlineCode(readProgressItemField(block, 'Evidence')),
+    fallbackReason: stripProgressInlineCode(readProgressItemField(block, 'Fallback reason')),
+    promotionExplanation: stripProgressInlineCode(readProgressItemField(block, 'Promotion explanation')),
+    blockReason: stripProgressInlineCode(readProgressItemField(block, 'Block reason')),
   };
 }
 
@@ -4722,6 +6753,15 @@ function updateProgressItemBlock(block, status, resultText, options = {}) {
     insertBeforeLabel: 'Fallback reason',
   });
 
+  if (Object.prototype.hasOwnProperty.call(options, 'evidence') && options.evidence !== undefined) {
+    updated = upsertProgressItemField(
+      updated,
+      'Evidence',
+      `\`${sanitizeOptionalInlineCode(options.evidence)}\``,
+      { insertBeforeLabel: 'Fallback reason' },
+    );
+  }
+
   if (Object.prototype.hasOwnProperty.call(options, 'fallbackReason') && options.fallbackReason !== undefined) {
     updated = upsertProgressItemField(
       updated,
@@ -4760,9 +6800,12 @@ function buildProgressItemBlock(options) {
     `  - Output: ${options.output}`,
     `  - Verify: ${options.verify}`,
     `  - Owner: \`${options.owner}\``,
+    `  - Agent: \`${sanitizeOptionalInlineCode(options.agent || options.owner)}\``,
+    `  - Mode: \`${sanitizeOptionalInlineCode(options.mode || 'standard')}\``,
     `  - Status: \`${options.status}\``,
     `  - Retry budget: \`${options.retryBudget}\``,
     `  - Result: \`${sanitizeInlineCode(options.resultText)}\``,
+    `  - Evidence: \`${sanitizeOptionalInlineCode(options.evidence)}\``,
     `  - Fallback reason: \`${sanitizeOptionalInlineCode(options.fallbackReason)}\``,
   ];
 
@@ -4785,6 +6828,7 @@ function upsertProgressItemResult(progressPath, options) {
   if (existingItem) {
     const updatedBlock = updateProgressItemBlock(existingItem.block, status, resultText, {
       retryBudget: options.retryBudget,
+      evidence: options.evidence,
       fallbackReason: options.fallbackReason,
       blockReason: options.blockReason,
     });
@@ -4803,9 +6847,12 @@ function upsertProgressItemResult(progressPath, options) {
     output: options.output,
     verify: options.verify,
     owner: options.owner,
+    agent: options.agent,
+    mode: options.mode,
     status,
     retryBudget: options.retryBudget,
     resultText,
+    evidence: options.evidence,
     fallbackReason: options.fallbackReason,
     blockReason: options.blockReason,
   });
@@ -5250,6 +7297,29 @@ function readConfiguredCopilotCommand(repoRoot) {
   }
 }
 
+function readConfiguredProductLoopDefaultMaxIterations(repoRoot) {
+  const configPath = path.join(repoRoot, HARNESS_DIR_NAME, HARNESS_CONFIG_FILE);
+  if (!pathExists(configPath) || !fs.statSync(configPath).isFile()) {
+    return null;
+  }
+
+  try {
+    const parsedConfig = readJsonFile(configPath);
+    const configuredDefault =
+      parsedConfig
+      && parsedConfig.loop
+      && parsedConfig.loop.defaultMaxIterations;
+
+    if (configuredDefault === undefined || configuredDefault === null || configuredDefault === '') {
+      return null;
+    }
+
+    return parsePositiveIntegerOption(configuredDefault, 'loop.defaultMaxIterations');
+  } catch {
+    return null;
+  }
+}
+
 function resolveDoctorCopilotCommand(repoRoot, platform = process.platform) {
   return readConfiguredCopilotCommand(repoRoot) || getPlatformCopilotCommand(platform);
 }
@@ -5452,9 +7522,16 @@ function usage() {
     'Usage:',
     `  ${commandPrefix} doctor`,
     `  ${commandPrefix} prepare --from <feature-path>`,
-    `  ${commandPrefix} run --max-iterations <positive-integer>`,
+    `  ${commandPrefix} prepare --request <text> [--constraint <value>]`,
+    `  ${commandPrefix} run [--max-iterations <positive-integer>]`,
     `  ${commandPrefix} status`,
     `  ${commandPrefix} verify`,
+    '',
+    'Four-agent product loop: qa-orchestrator routes qa-planner, qa-executor, and qa-verifier.',
+    'Default run budget: 40 iterations unless --max-iterations is provided.',
+    'Each iteration uses a fresh Copilot worker context and durable .qa-harness/ memory.',
+    'Coverage proof is Playwright CLI first, MCP fallback second when CLI cannot proceed, and full Playwright execution before pass.',
+    'Jira API integration is out of scope; prepare --request accepts Jira links or text as source context only.',
   ].join('\n');
 }
 
@@ -5625,7 +7702,7 @@ function writeLeanCommandResult(command, result, stdout, stderr) {
   const status = result && typeof result.status === 'string' ? result.status : '';
   const exitCode = result && Number.isInteger(result.exitCode)
     ? result.exitCode
-    : ['blocked', 'fail', 'failed', 'stalled'].includes(status)
+    : ['fail', 'failed', 'stalled'].includes(status)
       ? 1
       : 0;
   const output =
@@ -5636,10 +7713,10 @@ function writeLeanCommandResult(command, result, stdout, stderr) {
         : `${command} completed.\n`;
   const normalizedOutput = output.endsWith('\n') ? output : `${output}\n`;
 
-  if (exitCode === 0) {
-    stdout.write(normalizedOutput);
-  } else {
+  if (exitCode !== 0 || status === 'blocked') {
     stderr.write(normalizedOutput);
+  } else {
+    stdout.write(normalizedOutput);
   }
 
   return exitCode;
@@ -5673,10 +7750,24 @@ function assertLeanCliOptions(command, cliOptions, allowedKeys) {
 }
 
 function buildLeanPrepareCliOptions(cliOptions) {
-  assertLeanCliOptions('prepare', cliOptions, ['from']);
+  assertLeanCliOptions('prepare', cliOptions, ['from', 'request', 'constraint']);
+  const hasFrom = hasMeaningfulString(cliOptions.from);
+  const hasRequest = hasMeaningfulString(cliOptions.request);
 
-  if (!hasMeaningfulString(cliOptions.from)) {
-    throw new Error(`Missing required option --from for prepare.\n\n${usage()}`);
+  if (hasFrom && hasRequest) {
+    throw new Error(`prepare accepts either --from or --request, but not both.\n\n${usage()}`);
+  }
+
+  if (!hasFrom && !hasRequest) {
+    throw new Error(`Missing required option --from or --request for prepare.\n\n${usage()}`);
+  }
+
+  if (hasRequest) {
+    return {
+      request: normalizePrepareCoverageRequest(cliOptions.request, {
+        constraints: cliOptions.constraint,
+      }),
+    };
   }
 
   return {
@@ -5684,11 +7775,13 @@ function buildLeanPrepareCliOptions(cliOptions) {
   };
 }
 
-function buildLeanRunCliOptions(cliOptions) {
+function buildLeanRunCliOptions(cliOptions, repoRoot) {
   assertLeanCliOptions('run', cliOptions, ['max-iterations']);
 
   return {
-    maxIterations: parsePositiveIntegerOption(cliOptions['max-iterations'], '--max-iterations'),
+    maxIterations: Object.prototype.hasOwnProperty.call(cliOptions, 'max-iterations')
+      ? parsePositiveIntegerOption(cliOptions['max-iterations'], '--max-iterations')
+      : readConfiguredProductLoopDefaultMaxIterations(repoRoot) || DEFAULT_PRODUCT_MAX_ITERATIONS,
   };
 }
 
@@ -5854,7 +7947,7 @@ function runCli(argv, options = {}) {
         const runOptions = {
           repoRoot,
           harnessPaths,
-          ...buildLeanRunCliOptions(parsed.options),
+          ...buildLeanRunCliOptions(parsed.options, repoRoot),
         };
         if (Object.prototype.hasOwnProperty.call(options, 'commandRunner')) {
           runOptions.commandRunner = options.commandRunner;
@@ -5908,6 +8001,7 @@ function runCli(argv, options = {}) {
 }
 
 module.exports = {
+  QA_AGENT_ROLES,
   createRun,
   createRunId,
   doctor,
@@ -5928,9 +8022,11 @@ module.exports = {
   prepareRun,
   resolveHarnessPaths,
   resolveGeneratedHarnessPaths,
+  resolveQaAgentTemplatePaths,
   resolveProjectCliInvocation,
   resolveRunPaths,
   runCli,
+  selectQaOrchestratorRoute,
   status,
   usage,
   validateRequestEnvelope,

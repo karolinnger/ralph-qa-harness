@@ -5,7 +5,7 @@ Last updated: 2026-04-27
 
 ## Purpose
 
-`ralph-qa-harness` is a lean command-line harness for supervised Playwright BDD work. It prepares one feature-backed work item, launches one fresh Copilot CLI process per run iteration, verifies generated Playwright BDD output, and records durable evidence on disk.
+`ralph-qa-harness` is a lean command-line harness for supervised Playwright BDD work. Its product runtime has exactly four agents: `qa-orchestrator`, `qa-planner`, `qa-executor`, and `qa-verifier`. The orchestrator owns the outer loop, selects one role and one bounded task per iteration, launches one fresh Copilot CLI worker context for that role, verifies generated Playwright BDD output, and records durable evidence on disk.
 
 The product worker runtime is Copilot CLI. `ralph-codex` and Codex are only the builder loop used to implement this package; they are not the runtime used by `ralph-qa-harness` after the package is built.
 
@@ -20,13 +20,14 @@ The harness is intentionally file-backed and explicit. Operators should be able 
 - Keep durable product state under `.qa-harness/`.
 - Keep generated Playwright BDD output separate from durable product state.
 - Run one bounded item per fresh Copilot process.
-- Mark work complete only after Copilot reports `pass` and supervisor verification passes.
+- Mark work complete only after `qa-verifier` reports `pass` and supervisor verification passes.
 
 ## Non-Goals
 
 - The product harness is not a general automation framework.
 - The product harness does not keep long-lived worker sessions.
-- The product harness does not run full browser execution during `verify`; it proves generated specs and listed tests.
+- The product harness does not add product roles beyond `qa-orchestrator`, `qa-planner`, `qa-executor`, and `qa-verifier`.
+- The product harness does not use the Jira API; Jira links or pasted ticket text are source context only.
 - The product harness does not store durable supervisor decisions in generated output directories.
 - The product harness does not stage, commit, push, or open pull requests.
 
@@ -43,6 +44,21 @@ The implementation effort and the product runtime are separate:
 | BDD generator | `playwright-bdd` | Generates executable Playwright specs from feature files. |
 | Test layer | Playwright | Lists generated tests and supplies browser/test infrastructure. |
 
+## Product Four-Agent Loop
+
+The product loop has exactly four roles:
+
+- `qa-orchestrator`
+  Owns the product loop, validates intake, selects one role and one bounded item, routes verifier failures back to executor healing when retry budget remains, and stops terminal states.
+- `qa-planner`
+  Creates and refines `.qa-harness/PRD.md`, `.qa-harness/progress.md`, and `.qa-harness/PROMPT.md` so work is split into bounded items with proof requirements.
+- `qa-executor`
+  Completes one selected task, creates run-local seed proof, uses Playwright CLI first, uses MCP fallback second only after CLI cannot proceed with a recorded reason and evidence, and promotes proven seed logic into BDD/framework files.
+- `qa-verifier`
+  Reviews proof, requires `bddgen export`, `bddgen test`, `playwright test --list`, and full `playwright test` for affected generated specs before final pass.
+
+Only the orchestrator owns the outer loop. Planner, executor, and verifier prompts never carry long-lived worker context across iterations; each product iteration starts a fresh Copilot process with a newly resolved role-scoped prompt.
+
 ## Command Surface
 
 The final CLI exposes only these commands:
@@ -50,12 +66,13 @@ The final CLI exposes only these commands:
 ```text
 ralph-qa-harness doctor
 ralph-qa-harness prepare --from <feature-path>
-ralph-qa-harness run --max-iterations <positive-integer>
+ralph-qa-harness prepare --request <text> [--constraint <value>]
+ralph-qa-harness run [--max-iterations <positive-integer>]
 ralph-qa-harness status
 ralph-qa-harness verify
 ```
 
-Unknown commands fail with exit code `1` and a clear message. Help output should list only the five commands above.
+Unknown commands fail with exit code `1` and a clear message. Help output should list only the command usage forms above.
 
 The npm package bin entrypoint remains:
 
@@ -110,6 +127,9 @@ Durable product state lives under `.qa-harness/` in the target project:
       loop-report.md
       validation.json
       diff.patch
+      seed.spec.ts
+      agents/
+        resolved-prompts/
       iterations/
         <nnn>/
           worker-prompt.md
@@ -118,6 +138,7 @@ Durable product state lives under `.qa-harness/` in the target project:
           summary.json
           validation.json
           diff.patch
+          evidence/
 ```
 
 Generated Playwright BDD output may live under `.features-gen/.qa-harness/`. That path is generated output only. It must not contain supervisor decisions, durable progress, prompts, status files, or run reports.
@@ -164,6 +185,8 @@ RALPH_NEXT: <next recommended action, or none>
 
 Each run directory records immutable-ish evidence for the run. Per-run files summarize the terminal result, latest verification, aggregate diff, and operator-readable report. Per-iteration files capture the exact worker prompt, stdout, stderr, parsed footer, command duration, changed files, validation result, and iteration diff.
 
+Run directories also contain run-local seed proof at `seed.spec.ts`, role prompt audit copies under `agents/resolved-prompts/`, and per-iteration `evidence/` directories. Summary and validation artifacts include `RALPH_AGENT` with one of the four valid product roles.
+
 ## `doctor`
 
 `doctor` checks the target project and reports each check separately as `pass` or `fail`:
@@ -196,14 +219,21 @@ On Windows, the default Copilot check is `copilot.cmd --help`. On non-Windows pl
 
 The initial progress file contains one unchecked item specific to the selected feature. The item states its input, expected output or evidence, and the validation that proves completion.
 
+## `prepare --request <text> [--constraint <value>]`
+
+`prepare --request` creates or refreshes durable harness artifacts from a coverage request. A complete request includes target URL or explicit app scope, Jira link/text or pasted requirements, and acceptance criteria. Repeated `--constraint` values are preserved as product constraints.
+
+Jira API integration is outside the product contract. The harness may store Jira links or ticket text as source context, but it does not authenticate to Jira or fetch issue data. Incomplete requests produce blocked intake state under `.qa-harness/`, concrete follow-up questions, and no speculative `normalized.feature` or generated output.
+
 ## `verify`
 
-`verify` runs deterministic list-time checks from the target project root:
+`verify` runs deterministic checks from the target project root:
 
 ```text
 npx bddgen export
 npx bddgen test
-npx playwright test --list
+npx playwright test --list <affected generated specs>
+npx playwright test <affected generated specs>
 ```
 
 On Windows, the implementation may spawn `npx.cmd` internally.
@@ -216,22 +246,27 @@ Verification fails when:
 - no generated spec can be found for the run-backed feature.
 - `playwright test --list` exits nonzero.
 - `playwright test --list` reports zero tests.
+- full `playwright test` exits nonzero.
+- full `playwright test` reports zero executed tests for coverage proof.
 
-When a run exists, `verify` writes structured validation output to `.qa-harness/runs/<run-id>/validation.json`. `verify` without a run still prints useful output and does not crash.
+Coverage items cannot pass on list-only evidence. When a run exists, `verify` writes structured validation output to `.qa-harness/runs/<run-id>/validation.json`. `verify` without a run still prints useful output and does not crash.
 
-## `run --max-iterations <positive-integer>`
+## `run [--max-iterations <positive-integer>]`
 
-`run` requires a prepared state and a positive integer iteration budget. Each iteration:
+`run` requires a prepared state and uses a default iteration budget of 40. Operators may override that budget with `--max-iterations <positive-integer>`. Each iteration:
 
-1. Selects exactly one unchecked item from `.qa-harness/progress.md`.
-2. Builds a worker prompt from `PRD.md`, `progress.md`, `PROMPT.md`, and the selected item.
+1. Lets `qa-orchestrator` select exactly one role and one bounded item from `.qa-harness/progress.md`.
+2. Builds a role-scoped worker prompt from `PRD.md`, `progress.md`, `PROMPT.md`, selected role templates, and the selected item.
 3. Writes the prompt to `.qa-harness/runs/<run-id>/iterations/<nnn>/worker-prompt.md`.
-4. Launches one fresh Copilot process.
+4. Launches one fresh Copilot process with no reused worker context.
 5. Sends the prompt on stdin.
 6. Captures stdout, stderr, exit code, duration, changed files, parsed footer, and diff.
 7. Stops immediately on missing footer, invalid footer, worker `fail`, worker `blocked`, validation failure, stalled progress, or budget exhaustion.
-8. Runs supervisor `verify` after a worker `pass`.
-9. Checks the selected item only when the worker passed and verification passed.
+8. Routes executor completion to verifier review before final pass.
+9. Runs supervisor `verify` after verifier pass.
+10. Checks the selected item only when verifier pass and supervisor verification pass.
+
+Coverage executor work must record run-local Playwright CLI seed evidence first. MCP fallback is second-choice evidence, allowed only when CLI discovery cannot proceed and the worker records a fallback reason plus durable MCP evidence. Restricted flows such as CAPTCHA, auth gates, anti-bot gates, age gates, and region restrictions are blocked rather than bypassed.
 
 The required footer status values are `pass`, `blocked`, and `fail`.
 
@@ -280,12 +315,14 @@ An item in `.qa-harness/progress.md` is complete only when all of these are true
 
 - Copilot exits zero.
 - The Copilot footer is present and valid.
+- The selected product role is `qa-verifier`.
 - `RALPH_STATUS` is `pass`.
-- Supervisor `verify` passes after Copilot exits.
+- Supervisor `verify` passes after verifier pass.
+- Coverage proof includes Playwright CLI seed evidence and full Playwright execution for affected generated specs.
 - The selected item is the item being marked complete.
 
 Any weaker outcome leaves the item unchecked and records the stop reason in run artifacts.
 
 ## Acceptance Summary
 
-The lean harness is acceptable when it exposes the five-command CLI, uses Copilot CLI as the product worker, uses Playwright plus `playwright-bdd` for executable BDD validation, keeps durable state under `.qa-harness/`, treats `.features-gen/.qa-harness/` only as generated output, excludes runtime paths through `.git/info/exclude`, launches one fresh Copilot process per iteration through stdin, records evidence per run and iteration, and never stages, commits, pushes, or creates pull requests.
+The lean harness is acceptable when it exposes the five-command CLI, uses exactly the four product agents, keeps the loop orchestrator-owned, uses Copilot CLI as the product worker, uses Playwright plus `playwright-bdd` for executable BDD validation, keeps durable state under `.qa-harness/`, treats `.features-gen/.qa-harness/` only as generated output, excludes runtime paths through `.git/info/exclude`, launches one fresh Copilot process per iteration through stdin, records Playwright CLI-first evidence with MCP fallback only as second-choice evidence, requires full Playwright execution before coverage pass, records evidence per run and iteration, treats Jira API integration as out of scope, and never stages, commits, pushes, or creates pull requests.

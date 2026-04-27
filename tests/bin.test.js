@@ -108,9 +108,16 @@ test('CLI help and doctor output work with the standalone prefix from a target-p
   assert.equal(helpExitCode, 0);
   assert.match(helpStdout, /npx ralph-qa-harness doctor/);
   assert.match(helpStdout, /npx ralph-qa-harness prepare --from <feature-path>/);
-  assert.match(helpStdout, /npx ralph-qa-harness run --max-iterations <positive-integer>/);
+  assert.match(helpStdout, /npx ralph-qa-harness prepare --request <text> \[--constraint <value>\]/);
+  assert.match(helpStdout, /npx ralph-qa-harness run \[--max-iterations <positive-integer>\]/);
   assert.match(helpStdout, /npx ralph-qa-harness status/);
   assert.match(helpStdout, /npx ralph-qa-harness verify/);
+  assert.match(helpStdout, /Four-agent product loop: qa-orchestrator routes qa-planner, qa-executor, and qa-verifier/);
+  assert.match(helpStdout, /Default run budget: 40 iterations/);
+  assert.match(helpStdout, /fresh Copilot worker context and durable \.qa-harness\/ memory/);
+  assert.match(helpStdout, /Playwright CLI first, MCP fallback second/);
+  assert.match(helpStdout, /full Playwright execution before pass/);
+  assert.match(helpStdout, /Jira API integration is out of scope/);
   assert.doesNotMatch(helpStdout, /create-run|prepare-run|verify-run|execute-run|advance-run|iterate-run|loop-run|preflight/);
   assert.equal(helpStderr, '');
 

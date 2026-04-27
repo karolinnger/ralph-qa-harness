@@ -15,9 +15,26 @@ function extractCommandBlockCommands(content, marker) {
   const commands = fencedBlock[1]
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => /^ralph-qa-harness (?:doctor|prepare --from <feature-path>|run --max-iterations <positive-integer>|status|verify)$/.test(line));
-  assert.equal(commands.length, 5, 'expected exactly five ralph-qa-harness command lines');
+    .filter((line) => /^ralph-qa-harness (?:doctor|prepare --from <feature-path>|prepare --request <text> \[--constraint <value>\]|run \[--max-iterations <positive-integer>\]|status|verify)$/.test(line));
+  assert.equal(commands.length, 6, 'expected exactly six ralph-qa-harness command usage lines');
   return commands;
+}
+
+function assertFourAgentPublicContract(content, label) {
+  assert.match(content, /exactly four (?:agents|roles)/i, `${label} must state the exact four-agent product loop`);
+  assert.match(content, /qa-orchestrator/i, `${label} must name qa-orchestrator`);
+  assert.match(content, /qa-planner/i, `${label} must name qa-planner`);
+  assert.match(content, /qa-executor/i, `${label} must name qa-executor`);
+  assert.match(content, /qa-verifier/i, `${label} must name qa-verifier`);
+  assert.match(content, /orchestrator owns|orchestrator-owned/i, `${label} must state the orchestrator-owned loop`);
+  assert.match(content, /default (?:budget|iteration budget) of 40|defaults? to (?:a budget of )?40/i, `${label} must document the default run budget`);
+  assert.match(content, /fresh (?:Copilot CLI |Copilot )?(?:worker )?context|fresh Copilot process/i, `${label} must document fresh worker context per iteration`);
+  assert.match(content, /\.qa-harness\/.*durable|durable .*\.qa-harness\//is, `${label} must document .qa-harness durable memory`);
+  assert.match(content, /Playwright CLI (?:seed evidence )?first/i, `${label} must document Playwright CLI first`);
+  assert.match(content, /MCP fallback (?:is allowed |is |as )?(?:second|second-choice)/i, `${label} must document MCP fallback second`);
+  assert.match(content, /Jira API integration is (?:out of scope|outside)/i, `${label} must document Jira API out of scope`);
+  assert.match(content, /full (?:`?playwright test`?|Playwright execution).*before (?:coverage )?pass|full Playwright execution.*required before coverage pass/is, `${label} must document full Playwright execution before pass`);
+  assert.doesNotMatch(content, /runs list-time Playwright BDD validation|does not run full browser execution|It does not run full browser execution/i, `${label} must not claim verification is list-only`);
 }
 
 test('package metadata exposes the standalone CLI package shape', () => {
@@ -109,7 +126,7 @@ test('examples show only the lean command flow', () => {
   assert.equal(fs.existsSync(path.join(examplesDir, 'qa-runtime-demo-agent.js')), false);
   assert.doesNotMatch(
     combinedExamples,
-    /adapter|external worker|MCP|Jira|explorer|healer|planner handoff|promotion|scenario addition|scenario-addition/i,
+    /adapter|external worker|explorer|healer|planner handoff|scenario addition|scenario-addition/i,
   );
   assert.doesNotMatch(
     combinedExamples,
@@ -120,7 +137,58 @@ test('examples show only the lean command flow', () => {
   assert.match(combinedExamples, /npx ralph-qa-harness run --max-iterations 2/);
   assert.match(combinedExamples, /npx ralph-qa-harness status/);
   assert.match(combinedExamples, /npx ralph-qa-harness verify/);
+  assertFourAgentPublicContract(combinedExamples, 'examples');
   assert.doesNotMatch(pkg.files.join('\n'), /qa-runtime-demo-agent/);
+});
+
+test('static four-agent role templates ship with role-scoped responsibilities', () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const packageJsonPath = path.join(packageRoot, 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+  const roles = [
+    {
+      role: 'qa-orchestrator',
+      dir: 'main-orchestrator',
+      required: [/RALPH_AGENT: qa-orchestrator/, /owns the product QA loop/i, /validates intake/i, /routes exactly one role/i, /does not implement test code/i],
+      forbidden: [/promote seed logic/i, /final verification proof/i],
+    },
+    {
+      role: 'qa-planner',
+      dir: 'planner',
+      required: [/RALPH_AGENT: qa-planner/, /creates and refines `.qa-harness\/PRD\.md`/i, /splits work into bounded progress items/i, /does not run browser discovery/i],
+      forbidden: [/seed\.spec\.ts/i, /final verification proof/i],
+    },
+    {
+      role: 'qa-executor',
+      dir: 'executor',
+      required: [/RALPH_AGENT: qa-executor/, /completes exactly one selected task/i, /seed\.spec\.ts/i, /Playwright CLI first/i, /MCP fallback/i, /reason and evidence/i, /promotes proven logic/i],
+      forbidden: [/owns the product QA loop/i, /final pass/i, /acceptance decision/i],
+    },
+    {
+      role: 'qa-verifier',
+      dir: 'verifier',
+      required: [/RALPH_AGENT: qa-verifier/, /reviews proof/i, /bddgen export/i, /bddgen test/i, /playwright test --list/i, /full `playwright test`/i],
+      forbidden: [/browser discovery/i, /promotes proven logic/i, /splits work into bounded progress items/i],
+    },
+  ];
+
+  assert.ok(pkg.files.includes('templates'));
+
+  for (const { role, dir, required, forbidden } of roles) {
+    for (const fileName of ['agent.md', 'skills.md']) {
+      const templatePath = path.join(packageRoot, 'templates', 'qa-agents', dir, fileName);
+      assert.equal(fs.existsSync(templatePath), true, `${role} ${fileName} must exist`);
+      const content = fs.readFileSync(templatePath, 'utf8');
+
+      assert.match(content, new RegExp(role), `${role} ${fileName} must name the role`);
+      for (const pattern of required) {
+        assert.match(content, pattern, `${role} ${fileName} must include ${pattern}`);
+      }
+      for (const pattern of forbidden) {
+        assert.doesNotMatch(content, pattern, `${role} ${fileName} must avoid ${pattern}`);
+      }
+    }
+  }
 });
 
 test('package metadata, docs, and CLI help stay aligned with the lean Copilot-first product', () => {
@@ -129,6 +197,7 @@ test('package metadata, docs, and CLI help stay aligned with the lean Copilot-fi
   const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
   const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
   const design = fs.readFileSync(path.join(packageRoot, 'docs', 'copilot-first-qa-ralph-harness.md'), 'utf8');
+  const example = fs.readFileSync(path.join(packageRoot, 'examples', 'use-from-another-project.md'), 'utf8');
   const packagingNotes = fs.readFileSync(path.join(packageRoot, 'docs', 'packaging-notes.md'), 'utf8');
   let helpOutput = '';
 
@@ -140,7 +209,8 @@ test('package metadata, docs, and CLI help stay aligned with the lean Copilot-fi
   const expectedCommands = [
     'ralph-qa-harness doctor',
     'ralph-qa-harness prepare --from <feature-path>',
-    'ralph-qa-harness run --max-iterations <positive-integer>',
+    'ralph-qa-harness prepare --request <text> [--constraint <value>]',
+    'ralph-qa-harness run [--max-iterations <positive-integer>]',
     'ralph-qa-harness status',
     'ralph-qa-harness verify',
   ];
@@ -157,6 +227,15 @@ test('package metadata, docs, and CLI help stay aligned with the lean Copilot-fi
   assert.doesNotMatch(packagingNotes, /qa-orchestrator|orchestrator/i);
   assert.deepEqual(extractCommandBlockCommands(readme, 'The operator-facing command surface is intentionally small:'), expectedCommands);
   assert.deepEqual(extractCommandBlockCommands(design, 'The final CLI exposes only these commands:'), expectedCommands);
+  assertFourAgentPublicContract(readme, 'README');
+  assertFourAgentPublicContract(design, 'design doc');
+  assertFourAgentPublicContract(example, 'example');
+  assert.match(helpOutput, /Four-agent product loop: qa-orchestrator routes qa-planner, qa-executor, and qa-verifier/);
+  assert.match(helpOutput, /Default run budget: 40 iterations/);
+  assert.match(helpOutput, /fresh Copilot worker context and durable \.qa-harness\/ memory/);
+  assert.match(helpOutput, /Playwright CLI first, MCP fallback second/);
+  assert.match(helpOutput, /full Playwright execution before pass/);
+  assert.match(helpOutput, /Jira API integration is out of scope/);
   assert.deepEqual(
     helpOutput
       .split(/\r?\n/)
