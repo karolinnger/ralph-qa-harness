@@ -10,6 +10,7 @@ function resolveRalphPaths(repoRoot) {
   const rootDir = path.join(repoRoot, '.ralph');
   return {
     rootDir,
+    prdPath: path.join(rootDir, 'PRD.md'),
     promptPath: path.join(rootDir, 'PROMPT.md'),
     planPath: path.join(rootDir, 'IMPLEMENTATION_PLAN.md'),
     progressPath: path.join(rootDir, 'progress.md'),

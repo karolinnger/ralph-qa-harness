@@ -3,6 +3,15 @@
 const { runProcess } = require('./process');
 const { parseRalphFooter } = require('./prompt');
 
+const REMOTE_WARNING_HTML_PATTERN = /(^|\n)([^\r\n]*(?:remote plugin sync request|events failed)[^\r\n]*403 Forbidden): <html>[\s\S]*?<\/html>\r?\n?/giu;
+
+function sanitizeCodexLog(text) {
+  return String(text || '').replace(
+    REMOTE_WARNING_HTML_PATTERN,
+    (_match, prefix, summary) => `${prefix}${summary}: [suppressed HTML response]\n`,
+  );
+}
+
 function buildCodexExecArgs({ config, repoRoot, overrides = {} }) {
   const codex = {
     ...config.codex,
@@ -35,6 +44,8 @@ function runCodexWorker({ repoRoot, config, prompt, env }) {
   });
   return {
     ...result,
+    stdout: sanitizeCodexLog(result.stdout),
+    stderr: sanitizeCodexLog(result.stderr),
     footer: parseRalphFooter(`${result.stdout}\n${result.stderr}`),
   };
 }
@@ -58,6 +69,8 @@ function runCodexVerifier({ repoRoot, config, prompt, env }) {
   });
   return {
     ...result,
+    stdout: sanitizeCodexLog(result.stdout),
+    stderr: sanitizeCodexLog(result.stderr),
     footer: parseRalphFooter(`${result.stdout}\n${result.stderr}`),
   };
 }
@@ -66,4 +79,5 @@ module.exports = {
   buildCodexExecArgs,
   runCodexWorker,
   runCodexVerifier,
+  sanitizeCodexLog,
 };

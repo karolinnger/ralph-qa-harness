@@ -35,6 +35,18 @@ test('captureDiff includes tracked diffs and synthetic untracked text diffs', (t
   assert.match(diff, /new file/);
 });
 
+test('captureDiff can be restricted to iteration changed files', (t) => {
+  const repoRoot = createTempRepo(t);
+  fs.appendFileSync(path.join(repoRoot, 'README.md'), 'preexisting dirty change\n', 'utf8');
+  writeFile(path.join(repoRoot, 'src', 'iteration-file.txt'), 'iteration change\n');
+
+  const diff = captureDiff(repoRoot, { changedFiles: ['src/iteration-file.txt'] });
+
+  assert.doesNotMatch(diff, /README\.md/);
+  assert.match(diff, /diff --ralph-untracked a\/src\/iteration-file\.txt b\/src\/iteration-file\.txt/);
+  assert.match(diff, /iteration change/);
+});
+
 test('commitIterationChanges does nothing unless enabled and blocks dirty baseline overlap', (t) => {
   const repoRoot = createTempRepo(t);
   fs.appendFileSync(path.join(repoRoot, 'README.md'), 'preexisting\n', 'utf8');

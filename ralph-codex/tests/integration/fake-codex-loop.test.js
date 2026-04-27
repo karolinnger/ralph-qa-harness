@@ -27,6 +27,16 @@ function setupRun(t, options = {}) {
   config.validationCommands = options.validationCommands || [];
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
 
+  if (typeof options.prd === 'string') {
+    fs.writeFileSync(path.join(repoRoot, '.ralph', 'PRD.md'), options.prd, 'utf8');
+  }
+  if (typeof options.progress === 'string') {
+    fs.writeFileSync(path.join(repoRoot, '.ralph', 'progress.md'), options.progress, 'utf8');
+  }
+  if (typeof options.prompt === 'string') {
+    fs.writeFileSync(path.join(repoRoot, '.ralph', 'PROMPT.md'), options.prompt, 'utf8');
+  }
+
   return repoRoot;
 }
 
@@ -56,6 +66,90 @@ test('run completes with fake Codex pass and writes iteration artifacts', (t) =>
   }
   assert.equal(fs.existsSync(path.join(repoRoot, '.ralph', 'runs', result.runId, 'loop-report.md')), true);
   assert.match(fs.readFileSync(path.join(repoRoot, '.ralph', 'progress.md'), 'utf8'), /Completed one task/);
+});
+
+test('run artifacts exclude pre-existing dirty files from iteration changes', (t) => {
+  const repoRoot = setupRun(t);
+  fs.appendFileSync(path.join(repoRoot, 'README.md'), 'pre-existing user work\n', 'utf8');
+
+  const exitCode = runCli(['run', '--max-iterations', '1'], {
+    repoRoot,
+    env: { ...process.env, RALPH_FAKE_CODEX_MODE: 'pass' },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+  const result = readLatestResult(repoRoot);
+  const diff = fs.readFileSync(
+    path.join(repoRoot, '.ralph', 'runs', result.runId, 'iterations', '001', 'diff.patch'),
+    'utf8',
+  );
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(result.changedFiles, ['ralph-output.txt']);
+  assert.match(diff, /ralph-output\.txt/);
+  assert.doesNotMatch(diff, /README\.md/);
+});
+
+test('run dispatches executor then verifier before completing a progress item', (t) => {
+  const repoRoot = setupRun(t, {
+    prd: '# PRD\n\nShip one thing.\n',
+    progress: '# Progress\n\n- [ ] `P-001` Ship one thing\n  - Status: `todo`\n',
+    validationCommands: [{ name: 'validation', command: process.execPath, args: [fakeValidationPath, 'pass'] }],
+  });
+
+  const exitCode = runCli(['run', '--max-iterations', '3'], {
+    repoRoot,
+    env: { ...process.env, RALPH_FAKE_CODEX_MODE: 'multi-role' },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+  const result = readLatestResult(repoRoot);
+  const roleLog = fs.readFileSync(path.join(repoRoot, 'role-log.txt'), 'utf8');
+  const progress = fs.readFileSync(path.join(repoRoot, '.ralph', 'progress.md'), 'utf8');
+  const firstSummary = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, '.ralph', 'runs', result.runId, 'iterations', '001', 'summary.json'), 'utf8'),
+  );
+  const secondSummary = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, '.ralph', 'runs', result.runId, 'iterations', '002', 'summary.json'), 'utf8'),
+  );
+
+  assert.equal(exitCode, 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.iterations, 2);
+  assert.match(roleLog, /^executor\r?\nverifier\r?\n$/);
+  assert.equal(firstSummary.role, 'executor');
+  assert.equal(secondSummary.role, 'verifier');
+  assert.match(progress, /Pending verifier: P-001/);
+  assert.match(progress, /Verifier accepted: P-001/);
+});
+
+test('run dispatches planner for empty progress and healer for failed items', (t) => {
+  const plannerRepo = setupRun(t, {
+    prd: '',
+    progress: '# Progress\n',
+  });
+  runCli(['run', '--max-iterations', '1'], {
+    repoRoot: plannerRepo,
+    env: { ...process.env, RALPH_FAKE_CODEX_MODE: 'multi-role' },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+  assert.match(fs.readFileSync(path.join(plannerRepo, 'role-log.txt'), 'utf8'), /^planner\r?\n$/);
+  assert.match(fs.readFileSync(path.join(plannerRepo, '.ralph', 'progress.md'), 'utf8'), /`P-001`/);
+
+  const healerRepo = setupRun(t, {
+    prd: '# PRD\n',
+    progress: '# Progress\n\n- [ ] `P-001` Fix failed proof\n  - Status: `fail`\n',
+    validationCommands: [{ name: 'validation', command: process.execPath, args: [fakeValidationPath, 'pass'] }],
+  });
+  runCli(['run', '--max-iterations', '3'], {
+    repoRoot: healerRepo,
+    env: { ...process.env, RALPH_FAKE_CODEX_MODE: 'multi-role' },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+  assert.match(fs.readFileSync(path.join(healerRepo, 'role-log.txt'), 'utf8'), /^healer\r?\nverifier\r?\n$/);
+  assert.equal(readLatestResult(healerRepo).status, 'completed');
 });
 
 test('run stops for blocked fail stalled validation failure and budget exhaustion', (t) => {

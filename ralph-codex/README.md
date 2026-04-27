@@ -2,6 +2,14 @@
 
 `ralph-codex` is a standalone Ralph loop supervisor for OpenAI Codex. The CLI owns the loop and starts a fresh Codex process for every iteration, while durable run memory lives in `.ralph/` inside the target repository.
 
+The v1 loop is lean multi-agent orchestration. It dispatches lightweight role prompts for `planner`, `executor`, `verifier`, and `healer` against three durable files:
+
+- `.ralph/PRD.md`
+- `.ralph/progress.md`
+- `.ralph/PROMPT.md`
+
+Roles are prompt modes, not separate runtimes. The supervisor stays sequential, records each iteration, runs deterministic validation, and treats verifier acceptance as the final-pass boundary.
+
 ## Quick Start
 
 From a target git repository:
@@ -14,7 +22,7 @@ node C:\Users\kolos\IdeaProjects\Colossus\ralph-codex\bin\ralph-codex.js doctor
 node C:\Users\kolos\IdeaProjects\Colossus\ralph-codex\bin\ralph-codex.js run --max-iterations 10
 ```
 
-`init` creates `.ralph/` and adds `.ralph/` to `.git/info/exclude`. It does not edit tracked `.gitignore`.
+`init` creates `.ralph/`, including `PRD.md`, `progress.md`, and `PROMPT.md`, and adds `.ralph/` to `.git/info/exclude`. It does not edit tracked `.gitignore`.
 
 ## Configuration
 
@@ -33,4 +41,4 @@ ralph-codex verify [--run-id <id>] [--codex-review true]
 ralph-codex doctor
 ```
 
-Every `run` iteration invokes a fresh Codex process with `codex exec` and passes the worker prompt on stdin.
+Every `run` iteration invokes a fresh Codex process with `codex exec` and passes the role prompt on stdin.

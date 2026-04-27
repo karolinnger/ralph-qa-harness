@@ -69,10 +69,30 @@ function readTextIfSmall(filePath) {
   return buffer.toString('utf8');
 }
 
-function captureDiff(repoRoot) {
-  const result = runGit(repoRoot, ['diff', '--binary', '--', '.', ':(exclude).ralph']);
+function normalizeChangedFiles(changedFiles) {
+  if (!Array.isArray(changedFiles)) {
+    return null;
+  }
+  return new Set(changedFiles
+    .filter((filePath) => typeof filePath === 'string' && filePath && !isRalphPath(filePath))
+    .map((filePath) => filePath.replace(/\\/gu, '/')));
+}
+
+function captureDiff(repoRoot, options = {}) {
+  const scopedFiles = normalizeChangedFiles(options.changedFiles);
+  if (scopedFiles && scopedFiles.size === 0) {
+    return '';
+  }
+  const diffArgs = scopedFiles
+    ? ['diff', '--binary', '--', ...Array.from(scopedFiles)]
+    : ['diff', '--binary', '--', '.', ':(exclude).ralph'];
+  const result = runGit(repoRoot, diffArgs);
   let diff = result.stdout || '';
-  const untracked = getStatusEntries(repoRoot).filter((entry) => entry.status === '??' && !isRalphPath(entry.path));
+  const untracked = getStatusEntries(repoRoot).filter((entry) => (
+    entry.status === '??'
+    && !isRalphPath(entry.path)
+    && (!scopedFiles || scopedFiles.has(entry.path))
+  ));
   for (const entry of untracked) {
     const absolutePath = path.join(repoRoot, entry.path);
     const content = readTextIfSmall(absolutePath);

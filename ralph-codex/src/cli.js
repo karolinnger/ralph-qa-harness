@@ -98,6 +98,12 @@ function initRalphWorkspace({ repoRoot, force = false }) {
   const paths = resolveRalphPaths(repoRoot);
   fs.mkdirSync(paths.rootDir, { recursive: true });
   fs.mkdirSync(paths.runsDir, { recursive: true });
+  writeFileUnlessExists(paths.prdPath, [
+    '# Ralph PRD',
+    '',
+    'Describe the target outcome, constraints, and success criteria for this Ralph run.',
+    '',
+  ].join('\n'), force);
   writeFileUnlessExists(paths.promptPath, [
     '# Ralph Standing Prompt',
     '',

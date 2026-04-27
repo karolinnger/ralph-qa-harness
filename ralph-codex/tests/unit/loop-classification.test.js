@@ -25,6 +25,7 @@ function base(overrides = {}) {
 test('classifyIteration returns fail for timeout nonzero exit and validation failure', () => {
   assert.equal(classifyIteration(base({ codexResult: { exitCode: 0, timedOut: true, stdout: '', stderr: '', footer: {} } })).classification, 'fail');
   assert.equal(classifyIteration(base({ codexResult: { exitCode: 2, timedOut: false, stdout: '', stderr: '', footer: {} } })).classification, 'fail');
+  assert.equal(classifyIteration(base({ codexResult: { exitCode: 0, timedOut: false, stdout: '', stderr: '', footer: { status: 'fail' } } })).classification, 'fail');
   assert.equal(classifyIteration(base({ validationResult: { status: 'fail' } })).classification, 'fail');
 });
 

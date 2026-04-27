@@ -5,8 +5,8 @@ const path = require('node:path');
 const { readConfig } = require('./config');
 const { runCodexWorker } = require('./codex');
 const { captureDiff, commitIterationChanges, getBaselineDirtyFiles, getChangedFiles, requireGitRepo } = require('./git');
-const { allTasksComplete, selectNextTask } = require('./plan');
-const { buildWorkerPrompt } = require('./prompt');
+const { allWorkComplete, selectNextAction } = require('./progress');
+const { buildRolePrompt } = require('./prompt');
 const { writeLoopReport } = require('./report');
 const {
   acquireLock,
@@ -39,6 +39,9 @@ function classifyIteration(input) {
   const footer = codexResult.footer || {};
   const validationResult = input.validationResult || {};
   if (codexResult.timedOut || codexResult.exitCode !== 0) {
+    return { classification: 'fail', stallCount: input.stallCount || 0 };
+  }
+  if (footer.status === 'fail') {
     return { classification: 'fail', stallCount: input.stallCount || 0 };
   }
   if (
@@ -111,6 +114,20 @@ function createResult({ runId, status, iterations, startedAt, finishedAt, change
   };
 }
 
+function roleRequiresVerifier(role) {
+  return ['executor', 'healer', 'explorer'].includes(role);
+}
+
+function iterationPassed(codexResult, validationResult) {
+  return (
+    !codexResult.timedOut
+    && codexResult.exitCode === 0
+    && codexResult.footer.status !== 'fail'
+    && codexResult.footer.status !== 'blocked'
+    && validationResult.status !== 'fail'
+  );
+}
+
 function runLoop(options) {
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
   requireGitRepo(repoRoot);
@@ -134,6 +151,7 @@ function runLoop(options) {
   const maxIterations = options.maxIterations || initialConfig.loop.maxIterations;
   const baselineDirtyFiles = getBaselineDirtyFiles(repoRoot);
   const baselineSnapshot = snapshotDirtyFiles(repoRoot, baselineDirtyFiles);
+  const runChangedFiles = new Set();
   let stallCount = 0;
   let result = null;
 
@@ -144,11 +162,17 @@ function runLoop(options) {
         config.loop.commitEachIteration = options.commitEachIteration;
       }
       const standingPrompt = readTextIfExists(paths.promptPath);
+      const prd = readTextIfExists(paths.prdPath);
       const implementationPlan = readTextIfExists(paths.planPath);
       const progress = readTextIfExists(paths.progressPath);
       readState(paths.statePath);
-      const selectedTask = selectNextTask(implementationPlan);
-      if (!selectedTask) {
+      const action = selectNextAction({
+        prd,
+        prompt: standingPrompt,
+        progress,
+        implementationPlan,
+      });
+      if (!action) {
         const validation = runValidationCommands({
           repoRoot,
           validationCommands: config.validationCommands,
@@ -157,11 +181,11 @@ function runLoop(options) {
         });
         result = createResult({
           runId,
-          status: allTasksComplete(implementationPlan) && ['pass', 'skipped'].includes(validation.status) ? 'completed' : 'budget-exhausted',
+          status: allWorkComplete({ progress, implementationPlan }) && ['pass', 'skipped'].includes(validation.status) ? 'completed' : 'budget-exhausted',
           iterations: iteration - 1,
           startedAt,
           finishedAt: new Date().toISOString(),
-          changedFiles: getChangedFiles(repoRoot),
+          changedFiles: Array.from(runChangedFiles).sort(),
           validationStatus: validation.status,
         });
         break;
@@ -169,11 +193,13 @@ function runLoop(options) {
 
       const iterationDir = path.join(runPaths.iterationsDir, String(iteration).padStart(3, '0'));
       fs.mkdirSync(iterationDir, { recursive: true });
-      const prompt = buildWorkerPrompt({
+      const prompt = buildRolePrompt({
+        role: action.role,
         standingPrompt,
+        prd,
         implementationPlan,
         progress,
-        selectedTask,
+        selectedTask: action.task,
         validationCommands: config.validationCommands,
       });
       fs.writeFileSync(path.join(iterationDir, 'worker-prompt.md'), prompt, 'utf8');
@@ -194,18 +220,27 @@ function runLoop(options) {
         env: options.env || process.env,
       });
       writeJson(path.join(iterationDir, 'validation.json'), validationResult);
-      const diff = captureDiff(repoRoot);
-      fs.writeFileSync(path.join(iterationDir, 'diff.patch'), diff, 'utf8');
       const changedFiles = getChangedFiles(repoRoot);
       const meaningfulChangedFiles = changedFiles.filter((filePath) => !filePath.startsWith('.ralph/'));
       const iterationChangedFiles = selectIterationChangedFiles(repoRoot, meaningfulChangedFiles, baselineSnapshot);
+      iterationChangedFiles.forEach((filePath) => runChangedFiles.add(filePath));
+      const diff = captureDiff(repoRoot, { changedFiles: iterationChangedFiles });
+      fs.writeFileSync(path.join(iterationDir, 'diff.patch'), diff, 'utf8');
       const planAfterIteration = readTextIfExists(paths.planPath);
+      const progressAfterIteration = readTextIfExists(paths.progressPath);
+      const successfulIteration = iterationPassed(codexResult, validationResult);
+      const progressForCompletion = action.role === 'verifier' && successfulIteration && action.task
+        ? `${progressAfterIteration}\nVerifier accepted: ${action.task.id}\n`
+        : progressAfterIteration;
       const noMeaningfulChanges = iterationChangedFiles.length === 0;
       const candidateStallCount = noMeaningfulChanges ? stallCount + 1 : 0;
       const classification = classifyIteration({
         codexResult,
         validationResult,
-        allTasksComplete: allTasksComplete(planAfterIteration),
+        allTasksComplete: allWorkComplete({
+          progress: progressForCompletion,
+          implementationPlan: planAfterIteration,
+        }),
         noMeaningfulChanges,
         stallCount: candidateStallCount,
         stalledNoChangeLimit: config.loop.stalledNoChangeLimit,
@@ -215,6 +250,13 @@ function runLoop(options) {
       stallCount = classification.stallCount;
 
       let finalClassification = classification.classification;
+      if (
+        roleRequiresVerifier(action.role)
+        && successfulIteration
+        && (finalClassification === 'completed' || finalClassification === 'continue')
+      ) {
+        finalClassification = iteration >= maxIterations ? 'budget-exhausted' : 'continue';
+      }
       let commitResult = { status: 'skipped' };
       if (finalClassification === 'completed' || finalClassification === 'continue' || finalClassification === 'budget-exhausted') {
         commitResult = commitIterationChanges({
@@ -235,7 +277,9 @@ function runLoop(options) {
         schemaVersion: 1,
         runId,
         iteration,
-        task: selectedTask,
+        role: action.role,
+        roleReason: action.reason,
+        task: action.task,
         startedAt: iterationStartedAt.toISOString(),
         finishedAt: new Date().toISOString(),
         durationMs: Date.now() - iterationStartedAt.getTime(),
@@ -255,8 +299,12 @@ function runLoop(options) {
         repoRoot,
         text: [
           `Iteration ${String(iteration).padStart(3, '0')}: ${finalClassification}`,
+          `Role: ${action.role}`,
+          action.task ? `Selected item: ${action.task.id}` : '',
           codexResult.footer.summary || 'No Codex summary provided.',
           `Validation: ${validationResult.status}`,
+          roleRequiresVerifier(action.role) && successfulIteration && action.task ? `Pending verifier: ${action.task.id}` : '',
+          action.role === 'verifier' && successfulIteration && action.task ? `Verifier accepted: ${action.task.id}` : '',
           commitResult.reason ? `Commit: ${commitResult.reason}` : '',
         ].filter(Boolean).join('\n\n'),
       });
@@ -267,7 +315,7 @@ function runLoop(options) {
         iterations: iteration,
         startedAt,
         finishedAt: new Date().toISOString(),
-        changedFiles: getChangedFiles(repoRoot),
+        changedFiles: Array.from(runChangedFiles).sort(),
         validationStatus: validationResult.status,
       });
       writeLoopReport({ loopReportPath: runPaths.loopReportPath, runId, summaries, result });
@@ -283,7 +331,7 @@ function runLoop(options) {
         iterations: maxIterations,
         startedAt,
         finishedAt: new Date().toISOString(),
-        changedFiles: getChangedFiles(repoRoot),
+        changedFiles: Array.from(runChangedFiles).sort(),
         validationStatus: 'skipped',
       });
     }

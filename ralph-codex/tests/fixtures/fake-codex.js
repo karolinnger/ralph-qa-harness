@@ -30,9 +30,91 @@ function markFirstUncheckedPlanItem(repoRoot) {
   fs.writeFileSync(planPath, plan.replace('- [ ]', '- [x]'), 'utf8');
 }
 
+function appendRoleLog(repoRoot, role) {
+  fs.appendFileSync(path.join(repoRoot, 'role-log.txt'), `${role}\n`, 'utf8');
+}
+
 function appendWorkFile(repoRoot) {
   const targetPath = path.join(repoRoot, 'ralph-output.txt');
   fs.appendFileSync(targetPath, `fake codex pass ${new Date(0).toISOString()}\n`, 'utf8');
+}
+
+function parseRole(prompt) {
+  const match = String(prompt || '').match(/^RALPH_ROLE:\s*(\S+)\s*$/imu);
+  return match ? match[1].trim().toLowerCase() : 'worker';
+}
+
+function parseSelectedTaskId(prompt) {
+  const match = String(prompt || '').match(/^Selected task:\s*(\S+)\s*$/imu);
+  return match && match[1] !== '(none)' ? match[1].trim() : 'P-001';
+}
+
+function replaceSelectedProgressStatus(repoRoot, selectedId, status, checked = false) {
+  const progressPath = path.join(repoRoot, '.ralph', 'progress.md');
+  if (!fs.existsSync(progressPath)) {
+    return;
+  }
+  const lines = fs.readFileSync(progressPath, 'utf8').split(/\r?\n/u);
+  let insideSelected = false;
+  let statusReplaced = false;
+  const nextLines = [];
+  for (const line of lines) {
+    const itemMatch = line.match(/^(\s*)-\s+\[[ xX]\]\s+`([^`]+)`\s+(.+)$/u);
+    if (itemMatch) {
+      insideSelected = itemMatch[2] === selectedId;
+      nextLines.push(
+        insideSelected
+          ? `${itemMatch[1]}- [${checked ? 'x' : ' '}] \`${itemMatch[2]}\` ${itemMatch[3]}`
+          : line,
+      );
+      continue;
+    }
+    if (insideSelected && /^\s+-\s+Status:/iu.test(line)) {
+      nextLines.push(`  - Status: \`${status}\``);
+      statusReplaced = true;
+      insideSelected = false;
+      continue;
+    }
+    nextLines.push(line);
+  }
+  if (!statusReplaced) {
+    nextLines.push(`  - Status: \`${status}\``);
+  }
+  fs.writeFileSync(progressPath, nextLines.join('\n'), 'utf8');
+}
+
+function runMultiRole(repoRoot, prompt) {
+  const role = parseRole(prompt);
+  const selectedId = parseSelectedTaskId(prompt);
+  appendRoleLog(repoRoot, role);
+
+  if (role === 'planner') {
+    fs.writeFileSync(path.join(repoRoot, '.ralph', 'PRD.md'), '# PRD\n\nPlanned by fake Codex.\n', 'utf8');
+    fs.writeFileSync(path.join(repoRoot, '.ralph', 'PROMPT.md'), '# Prompt\n\nExecute the fake plan.\n', 'utf8');
+    fs.writeFileSync(
+      path.join(repoRoot, '.ralph', 'progress.md'),
+      '# Progress\n\n- [ ] `P-001` Implement the planned slice\n  - Status: `todo`\n',
+      'utf8',
+    );
+    process.stdout.write('RALPH_STATUS: pass\nRALPH_SUMMARY: Planner created run artifacts.\nRALPH_VALIDATION: not run\nRALPH_NEXT: execute P-001\n');
+    return;
+  }
+
+  if (role === 'executor' || role === 'healer') {
+    appendWorkFile(repoRoot);
+    replaceSelectedProgressStatus(repoRoot, selectedId, 'needs-verification', false);
+    process.stdout.write(`RALPH_STATUS: pass\nRALPH_SUMMARY: ${role} prepared ${selectedId} for verification.\nRALPH_VALIDATION: fake validation\nRALPH_NEXT: verifier\n`);
+    return;
+  }
+
+  if (role === 'verifier') {
+    replaceSelectedProgressStatus(repoRoot, selectedId, 'pass', true);
+    process.stdout.write(`RALPH_STATUS: pass\nRALPH_SUMMARY: Verifier accepted ${selectedId}.\nRALPH_VALIDATION: fake validation\nRALPH_NEXT: none\n`);
+    return;
+  }
+
+  appendWorkFile(repoRoot);
+  process.stdout.write('RALPH_STATUS: pass\nRALPH_SUMMARY: Completed one task.\nRALPH_VALIDATION: fake validation\nRALPH_NEXT: none\n');
 }
 
 function main() {
@@ -72,6 +154,10 @@ function main() {
   }
   if (mode === 'no-change') {
     process.stdout.write('RALPH_STATUS: pass\nRALPH_SUMMARY: Reported success without changes.\nRALPH_VALIDATION: not run\nRALPH_NEXT: retry\n');
+    return;
+  }
+  if (mode === 'multi-role') {
+    runMultiRole(repoRoot, prompt);
     return;
   }
 
