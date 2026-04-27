@@ -232,7 +232,8 @@ function runLoop(options) {
       const progressForCompletion = action.role === 'verifier' && successfulIteration && action.task
         ? `${progressAfterIteration}\nVerifier accepted: ${action.task.id}\n`
         : progressAfterIteration;
-      const noMeaningfulChanges = iterationChangedFiles.length === 0;
+      const durableProgressChanged = planAfterIteration !== implementationPlan || progressAfterIteration !== progress;
+      const noMeaningfulChanges = iterationChangedFiles.length === 0 && !durableProgressChanged;
       const candidateStallCount = noMeaningfulChanges ? stallCount + 1 : 0;
       const classification = classifyIteration({
         codexResult,

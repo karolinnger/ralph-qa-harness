@@ -123,6 +123,35 @@ test('run dispatches executor then verifier before completing a progress item', 
   assert.match(progress, /Verifier accepted: P-001/);
 });
 
+test('run continues through accepted implementation plan items even when only progress changes', (t) => {
+  const repoRoot = setupRun(t, {
+    plan: '# Plan\n\n- [ ] first already satisfied slice\n- [ ] second already satisfied slice\n',
+    prd: '# PRD\n\nShip existing satisfied slices.\n',
+    progress: '# Progress\n',
+    validationCommands: [{ name: 'validation', command: process.execPath, args: [fakeValidationPath, 'pass'] }],
+  });
+
+  const exitCode = runCli(['run', '--max-iterations', '4'], {
+    repoRoot,
+    env: { ...process.env, RALPH_FAKE_CODEX_MODE: 'multi-role-no-product-change' },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+  const result = readLatestResult(repoRoot);
+  const roles = [1, 2, 3, 4].map((iteration) => JSON.parse(
+    fs.readFileSync(
+      path.join(repoRoot, '.ralph', 'runs', result.runId, 'iterations', String(iteration).padStart(3, '0'), 'summary.json'),
+      'utf8',
+    ),
+  ).role);
+
+  assert.equal(exitCode, 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.iterations, 4);
+  assert.deepEqual(result.changedFiles, []);
+  assert.deepEqual(roles, ['executor', 'verifier', 'executor', 'verifier']);
+});
+
 test('run dispatches planner for empty progress and healer for failed items', (t) => {
   const plannerRepo = setupRun(t, {
     prd: '',

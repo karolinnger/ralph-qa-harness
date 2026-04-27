@@ -1,7 +1,7 @@
 {
   "name": "ralph-qa-harness",
   "version": "0.1.0",
-  "description": "Artifact-first standalone npm CLI for Playwright BDD QA workflows with a narrow, documented target-project contract.",
+  "description": "Lean Copilot-first QA harness for supervised Playwright BDD workflows with durable .qa-harness evidence.",
   "main": "./scripts/qa-harness.js",
   "bin": {
     "ralph-qa-harness": "./bin/ralph-qa-harness.js"
@@ -9,7 +9,6 @@
   "type": "commonjs",
   "scripts": {
     "test": "node --test --test-isolation=none tests/harness/qa-harness.test.js tests/doctor.test.js tests/bin.test.js tests/package.test.js",
-    "qa:orchestrator": "node ./scripts/qa-orchestrator.js",
     "cli": "node ./bin/ralph-qa-harness.js"
   },
   "files": [
@@ -26,7 +25,9 @@
     "playwright",
     "playwright-bdd",
     "cli",
-    "artifact-first"
+    "copilot",
+    "copilot-first",
+    "supervised"
   ],
   "author": "",
   "license": "UNLICENSED",

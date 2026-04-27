@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   allProgressItemsComplete,
+  allWorkComplete,
   parseProgressItems,
   selectNextAction,
 } = require('../../src/progress');
@@ -126,6 +127,55 @@ test('selectNextAction chooses planner executor healer and verifier from durable
   );
 });
 
+test('selectNextAction does not keep selecting verifier after a rejection closes pending review', () => {
+  assert.deepEqual(
+    selectNextAction({
+      prd: '# PRD\n',
+      prompt: '# Prompt\n',
+      progress: [
+        '- [ ] `P-001` fix failed proof',
+        '  - Status: `fail`',
+        '',
+        'Pending verifier: P-001',
+        '',
+        'Verifier rejected: P-001',
+      ].join('\n'),
+      implementationPlan: '',
+    }),
+    {
+      role: 'healer',
+      reason: 'failed or blocked progress item',
+      task: {
+        id: 'P-001',
+        line: 1,
+        checked: false,
+        text: 'fix failed proof',
+        heading: '',
+        status: 'fail',
+      },
+    },
+  );
+
+  assert.equal(
+    selectNextAction({
+      prd: '# PRD\n',
+      prompt: '# Prompt\n',
+      progress: [
+        '- [ ] `P-001` fix failed proof',
+        '  - Status: `needs-verification`',
+        '',
+        'Pending verifier: P-001',
+        '',
+        'Verifier rejected: P-001',
+        '',
+        'Pending verifier: P-001',
+      ].join('\n'),
+      implementationPlan: '',
+    }).role,
+    'verifier',
+  );
+});
+
 test('allProgressItemsComplete requires verifier acceptance for unchecked items', () => {
   assert.equal(
     allProgressItemsComplete('- [ ] `P-001` implement\n  - Status: `needs-verification`\n'),
@@ -139,5 +189,46 @@ test('allProgressItemsComplete requires verifier acceptance for unchecked items'
       'Verifier accepted: P-001',
     ].join('\n')),
     true,
+  );
+});
+
+test('accepted implementation plan items do not complete or reselect the whole plan while unchecked items remain', () => {
+  const implementationPlan = [
+    '# Implementation Plan',
+    '',
+    '- [ ] first plan item',
+    '- [ ] second plan item',
+    '',
+  ].join('\n');
+  const progress = [
+    '# Progress',
+    '',
+    '- [x] `L3` first plan item',
+    '  - Status: `final-pass`',
+    '',
+    'Verifier accepted: L3',
+    '',
+  ].join('\n');
+
+  assert.equal(allWorkComplete({ progress, implementationPlan }), false);
+  assert.deepEqual(
+    selectNextAction({
+      prd: '# PRD\n',
+      prompt: '# Prompt\n',
+      progress,
+      implementationPlan,
+    }),
+    {
+      role: 'executor',
+      reason: 'legacy implementation plan item',
+      task: {
+        id: 'L4',
+        line: 4,
+        checked: false,
+        text: 'second plan item',
+        heading: 'Implementation Plan',
+        status: 'todo',
+      },
+    },
   );
 });

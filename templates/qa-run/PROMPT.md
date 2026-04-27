@@ -1,4 +1,4 @@
-# Ralph Iteration Prompt
+# Copilot Worker Prompt
 
 ## Run Context
 
@@ -6,36 +6,32 @@
 - Intent: `<intent>`
 - Mode: `<mode>`
 - Source reference: `<source-ref>`
-- Execution truth: `normalized.feature`
+- Durable objective: `.qa-harness/PRD.md`
+- Durable progress: `.qa-harness/progress.md`
+- Durable worker rules: `.qa-harness/PROMPT.md`
+- Execution truth: `.qa-harness/normalized.feature`
 
-Study `PRD.md` thoroughly.
+Read `.qa-harness/PRD.md`, `.qa-harness/progress.md`, `.qa-harness/PROMPT.md`, and `.qa-harness/normalized.feature` before editing.
 
-Study `progress.md` thoroughly.
+Use the written artifacts as durable memory. Do not rely on previous session history.
 
-Study `normalized.feature` thoroughly.
+Complete exactly one selected unchecked item from `.qa-harness/progress.md`.
 
-Use the written artifacts as the source of truth. Do not rely on previous session history.
+Keep durable state and evidence in `.qa-harness/`.
 
-If the orchestrator provides a selected progress item through the runtime adapter, work only on that item.
+Use Playwright and `playwright-bdd` commands when validating feature generation or listed tests.
 
-Otherwise, pick the highest-leverage unchecked progress item that can be completed safely in one iteration.
-
-Complete exactly one atomic task.
-
-Use this tool order:
-
-1. Playwright CLI
-2. Playwright test or debug bridge
-3. MCP only after Playwright CLI and the Playwright test/debug bridge are exhausted
-
-If Playwright CLI is insufficient, request the Playwright test/debug bridge before considering MCP.
-
-If MCP is used, record the exact fallback reason in `progress.md` and `logs/fallback.log`.
-
-After implementation, run an unbiased verification step.
-
-Only mark the task complete if verification passes.
-
-If verification fails, mark the task `fail` or `blocked` and record the cause.
+Do not stage, commit, push, or create a pull request.
 
 Do not broaden scope. Do not pick multiple tasks. Do not rewrite the plan.
+
+The supervisor will run `ralph-qa-harness verify` after the worker exits.
+
+## Required Footer
+
+Every response must end with this exact footer:
+
+RALPH_STATUS: pass|blocked|fail
+RALPH_SUMMARY: <one concise paragraph>
+RALPH_VALIDATION: <commands run, or why not run>
+RALPH_NEXT: <next recommended action, or none>

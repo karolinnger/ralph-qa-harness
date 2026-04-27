@@ -1,6 +1,6 @@
 'use strict';
 
-const { allTasksComplete, parsePlanCheckboxes, selectNextTask } = require('./plan');
+const { parsePlanCheckboxes } = require('./plan');
 
 const HEALER_STATUSES = new Set(['fail', 'failed', 'blocked']);
 const EXECUTOR_STATUSES = new Set(['todo', 'doing', '']);
@@ -64,12 +64,32 @@ function parseEventIds(progress, label) {
   return ids;
 }
 
+function parseEventEntries(progress, label) {
+  const events = [];
+  const content = String(progress || '');
+  const pattern = new RegExp(`^${label}:\\s*(\\S+)\\s*$`, 'gimu');
+  let match = pattern.exec(content);
+  while (match) {
+    events.push({
+      id: match[1].trim(),
+      index: match.index,
+    });
+    match = pattern.exec(content);
+  }
+  return events;
+}
+
 function findPendingVerifierItem(progress, items) {
-  const pendingIds = parseEventIds(progress, 'Pending verifier');
-  const acceptedIds = new Set(parseEventIds(progress, 'Verifier accepted'));
-  for (let index = pendingIds.length - 1; index >= 0; index -= 1) {
-    const id = pendingIds[index];
-    if (!acceptedIds.has(id)) {
+  const pendingEvents = parseEventEntries(progress, 'Pending verifier');
+  const closingEvents = [
+    ...parseEventEntries(progress, 'Verifier accepted'),
+    ...parseEventEntries(progress, 'Verifier rejected'),
+  ];
+  for (let index = pendingEvents.length - 1; index >= 0; index -= 1) {
+    const pendingEvent = pendingEvents[index];
+    const id = pendingEvent.id;
+    const hasLaterClose = closingEvents.some((event) => event.id === id && event.index > pendingEvent.index);
+    if (!hasLaterClose) {
       return items.find((item) => item.id === id) || {
         id,
         line: 0,
@@ -81,6 +101,35 @@ function findPendingVerifierItem(progress, items) {
     }
   }
   return items.find((item) => VERIFY_STATUSES.has(item.status)) || null;
+}
+
+function planItemAccepted(progress, item) {
+  if (!item) {
+    return false;
+  }
+  const acceptedIds = new Set(parseEventIds(progress, 'Verifier accepted'));
+  if (acceptedIds.has(item.id)) {
+    return true;
+  }
+  return parseProgressItems(progress).some((progressItem) => (
+    progressItem.id === item.id
+    && (progressItem.checked || progressItem.status === 'pass' || acceptedIds.has(progressItem.id))
+  ));
+}
+
+function planHasProgress(progress, planItems) {
+  const planIds = new Set(planItems.map((item) => item.id));
+  if (parseEventIds(progress, 'Verifier accepted').some((id) => planIds.has(id))) {
+    return true;
+  }
+  if (parseEventIds(progress, 'Pending verifier').some((id) => planIds.has(id))) {
+    return true;
+  }
+  return parseProgressItems(progress).some((item) => planIds.has(item.id));
+}
+
+function selectNextPlanTask(implementationPlan, progress) {
+  return parsePlanCheckboxes(implementationPlan).find((item) => !item.checked && !planItemAccepted(progress, item)) || null;
 }
 
 function convertPlanTaskToProgressTask(task) {
@@ -95,7 +144,16 @@ function convertPlanTaskToProgressTask(task) {
 
 function selectNextAction({ prd, prompt, progress, implementationPlan }) {
   const items = parseProgressItems(progress);
-  const nextPlanTask = convertPlanTaskToProgressTask(selectNextTask(implementationPlan));
+  const nextPlanTask = convertPlanTaskToProgressTask(selectNextPlanTask(implementationPlan, progress));
+  const pendingVerifier = findPendingVerifierItem(progress, items);
+  if (pendingVerifier) {
+    return {
+      role: 'verifier',
+      reason: 'pending verifier review',
+      task: pendingVerifier,
+    };
+  }
+
   if (items.length === 0 && nextPlanTask && hasMeaningfulArtifact(prd)) {
     return {
       role: 'executor',
@@ -109,15 +167,6 @@ function selectNextAction({ prd, prompt, progress, implementationPlan }) {
       role: 'planner',
       reason: 'missing or empty PRD/progress artifacts',
       task: null,
-    };
-  }
-
-  const pendingVerifier = findPendingVerifierItem(progress, items);
-  if (pendingVerifier) {
-    return {
-      role: 'verifier',
-      reason: 'pending verifier review',
-      task: pendingVerifier,
     };
   }
 
@@ -160,10 +209,14 @@ function allProgressItemsComplete(progress) {
 }
 
 function allWorkComplete({ progress, implementationPlan }) {
+  const planItems = parsePlanCheckboxes(implementationPlan);
+  if (planItems.length > 0 && planHasProgress(progress, planItems)) {
+    return planItems.every((item) => item.checked || planItemAccepted(progress, item));
+  }
   if (allProgressItemsComplete(progress)) {
     return true;
   }
-  return parseProgressItems(progress).length === 0 && allTasksComplete(implementationPlan);
+  return false;
 }
 
 module.exports = {

@@ -83,10 +83,12 @@ function replaceSelectedProgressStatus(repoRoot, selectedId, status, checked = f
   fs.writeFileSync(progressPath, nextLines.join('\n'), 'utf8');
 }
 
-function runMultiRole(repoRoot, prompt) {
+function runMultiRole(repoRoot, prompt, options = {}) {
   const role = parseRole(prompt);
   const selectedId = parseSelectedTaskId(prompt);
-  appendRoleLog(repoRoot, role);
+  if (!options.skipRoleLog) {
+    appendRoleLog(repoRoot, role);
+  }
 
   if (role === 'planner') {
     fs.writeFileSync(path.join(repoRoot, '.ralph', 'PRD.md'), '# PRD\n\nPlanned by fake Codex.\n', 'utf8');
@@ -101,7 +103,9 @@ function runMultiRole(repoRoot, prompt) {
   }
 
   if (role === 'executor' || role === 'healer') {
-    appendWorkFile(repoRoot);
+    if (!options.skipProductChange) {
+      appendWorkFile(repoRoot);
+    }
     replaceSelectedProgressStatus(repoRoot, selectedId, 'needs-verification', false);
     process.stdout.write(`RALPH_STATUS: pass\nRALPH_SUMMARY: ${role} prepared ${selectedId} for verification.\nRALPH_VALIDATION: fake validation\nRALPH_NEXT: verifier\n`);
     return;
@@ -158,6 +162,10 @@ function main() {
   }
   if (mode === 'multi-role') {
     runMultiRole(repoRoot, prompt);
+    return;
+  }
+  if (mode === 'multi-role-no-product-change') {
+    runMultiRole(repoRoot, prompt, { skipProductChange: true, skipRoleLog: true });
     return;
   }
 
