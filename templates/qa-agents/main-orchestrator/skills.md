@@ -16,6 +16,7 @@ RALPH_AGENT: qa-orchestrator
 - Choose `qa-executor` when a todo item needs implementation or a verifier failure has retry budget remaining.
 - Choose `qa-verifier` when an item is marked `needs-verification`.
 - Stop instead of routing when a block reason is present or all required items are verifier-passed.
+- Route missing-dependency or preflight blockers as `blocked` outcomes within the existing four-role loop; do not create or request any additional QA roles.
 
 ## Boundaries
 

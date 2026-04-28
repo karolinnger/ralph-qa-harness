@@ -1633,16 +1633,61 @@ function buildLeanPreparePrompt() {
   ].join('\n');
 }
 
-function buildLeanPrepareConfig(platform) {
-  return `${JSON.stringify({
+function readExistingLeanPrepareConfig(configPath) {
+  if (!pathExists(configPath) || !fs.statSync(configPath).isFile()) {
+    return {};
+  }
+
+  try {
+    return readJsonFile(configPath);
+  } catch {
+    return {};
+  }
+}
+
+function normalizeConfiguredCopilotArgs(config) {
+  const args = config && config.copilot && config.copilot.args;
+  return Array.isArray(args)
+    ? args.filter((arg) => hasMeaningfulString(arg)).map((arg) => arg.trim())
+    : [];
+}
+
+function resolvePreparedConfigDefaultMaxIterations(config) {
+  const value = config && config.loop && config.loop.defaultMaxIterations;
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === 'string' && /^\d+$/.test(value.trim()) && Number.parseInt(value, 10) > 0) {
+    return Number.parseInt(value, 10);
+  }
+
+  return DEFAULT_PRODUCT_MAX_ITERATIONS;
+}
+
+function buildLeanPrepareConfig(platform, existingConfig = {}) {
+  const copilotCommand =
+    existingConfig
+    && existingConfig.copilot
+    && hasMeaningfulString(existingConfig.copilot.command)
+      ? existingConfig.copilot.command.trim()
+      : resolveDefaultCopilotCommand(platform || process.platform);
+  const copilotArgs = normalizeConfiguredCopilotArgs(existingConfig);
+  const config = {
     schemaVersion: 1,
     loop: {
-      defaultMaxIterations: DEFAULT_PRODUCT_MAX_ITERATIONS,
+      defaultMaxIterations: resolvePreparedConfigDefaultMaxIterations(existingConfig),
     },
     copilot: {
-      command: resolveDefaultCopilotCommand(platform || process.platform),
+      command: copilotCommand,
     },
-  }, null, 2)}\n`;
+  };
+
+  if (copilotArgs.length > 0) {
+    config.copilot.args = copilotArgs;
+  }
+
+  return `${JSON.stringify(config, null, 2)}\n`;
 }
 
 function formatCoverageRequestIntakeValue(value, fallback = 'missing') {
@@ -1844,7 +1889,13 @@ function writeBlockedCoverageIntakeArtifacts(repoRoot, harnessPaths, coverageReq
 
   ensureHarnessGitInfoExclude(repoRoot);
   fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
-  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
+  writeText(
+    harnessPaths.configPath,
+    buildLeanPrepareConfig(
+      options.platform || process.platform,
+      readExistingLeanPrepareConfig(harnessPaths.configPath),
+    ),
+  );
   writeText(harnessPaths.prdPath, buildBlockedCoverageIntakePrd(coverageRequest));
   writeText(harnessPaths.progressPath, buildBlockedCoverageIntakeProgress(coverageRequest));
   writeText(harnessPaths.promptPath, buildLeanPreparePrompt());
@@ -1878,7 +1929,13 @@ function writeAcceptedCoverageRequestArtifacts(repoRoot, harnessPaths, coverageR
 
   ensureHarnessGitInfoExclude(repoRoot);
   fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
-  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
+  writeText(
+    harnessPaths.configPath,
+    buildLeanPrepareConfig(
+      options.platform || process.platform,
+      readExistingLeanPrepareConfig(harnessPaths.configPath),
+    ),
+  );
   writeText(harnessPaths.prdPath, buildAcceptedCoverageRequestPrd(coverageRequest));
   writeText(harnessPaths.progressPath, buildAcceptedCoverageRequestProgress(coverageRequest));
   writeText(harnessPaths.promptPath, buildAcceptedCoverageRequestPrompt());
@@ -1959,7 +2016,13 @@ function prepare(options = {}) {
   ensureHarnessGitInfoExclude(repoRoot);
   fs.mkdirSync(harnessPaths.harnessDir, { recursive: true });
 
-  writeText(harnessPaths.configPath, buildLeanPrepareConfig(options.platform || process.platform));
+  writeText(
+    harnessPaths.configPath,
+    buildLeanPrepareConfig(
+      options.platform || process.platform,
+      readExistingLeanPrepareConfig(harnessPaths.configPath),
+    ),
+  );
   writeText(harnessPaths.prdPath, buildLeanPreparePrd(sourceDisplayPath, featureMetadata));
   writeText(harnessPaths.progressPath, buildLeanPrepareProgress(sourceDisplayPath));
   writeText(harnessPaths.promptPath, buildLeanPreparePrompt());
@@ -2846,6 +2909,7 @@ function run(options = {}) {
   const copilotCommand =
     readConfiguredCopilotCommand(repoRoot)
     || resolveDefaultCopilotCommand(options.platform || process.platform);
+  const copilotArgs = readConfiguredCopilotArgs(repoRoot);
   const commandRunner = options.commandRunner || runCommand;
   const env = options.env || process.env;
   const verifyFn = options.verifyFn || verify;
@@ -2897,7 +2961,7 @@ function run(options = {}) {
       iterationPaths = iterationPrompt;
       selectedAgent = iterationPrompt.RALPH_AGENT;
       beforeSnapshot = captureIterationSnapshot(repoRoot);
-      commandResult = normalizeWorkerCommandResult(commandRunner(copilotCommand, [], repoRoot, {
+      commandResult = normalizeWorkerCommandResult(commandRunner(copilotCommand, copilotArgs, repoRoot, {
         env,
         input: iterationPrompt.workerPrompt,
       }));
@@ -2960,7 +3024,7 @@ function run(options = {}) {
       iteration,
       RALPH_AGENT: selectedAgent,
       command: copilotCommand,
-      args: [],
+      args: copilotArgs,
       exitCode: commandResult.exitCode,
       durationMs,
       startedAt,
@@ -2993,6 +3057,7 @@ function run(options = {}) {
     iterations.push({
       iteration,
       command: copilotCommand,
+      args: copilotArgs,
       RALPH_AGENT: selectedAgent,
       exitCode: commandResult.exitCode,
       stdout: commandResult.stdout,
@@ -7294,6 +7359,23 @@ function readConfiguredCopilotCommand(repoRoot) {
     return hasMeaningfulString(command) ? command.trim() : '';
   } catch {
     return '';
+  }
+}
+
+function readConfiguredCopilotArgs(repoRoot) {
+  const configPath = path.join(repoRoot, HARNESS_DIR_NAME, HARNESS_CONFIG_FILE);
+  if (!pathExists(configPath) || !fs.statSync(configPath).isFile()) {
+    return [];
+  }
+
+  try {
+    const parsedConfig = readJsonFile(configPath);
+    const args = parsedConfig && parsedConfig.copilot && parsedConfig.copilot.args;
+    return Array.isArray(args)
+      ? args.filter((arg) => hasMeaningfulString(arg)).map((arg) => arg.trim())
+      : [];
+  } catch {
+    return [];
   }
 }
 

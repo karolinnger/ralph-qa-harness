@@ -59,6 +59,10 @@ The product loop has exactly four roles:
 
 Only the orchestrator owns the outer loop. Planner, executor, and verifier prompts never carry long-lived worker context across iterations; each product iteration starts a fresh Copilot process with a newly resolved role-scoped prompt.
 
+### Playwright Agent Mapping
+
+Official Playwright agent practices are mapped into the existing four-role loop as prompt responsibilities, not new product roles. Playwright planner behavior maps to `qa-planner`, which turns Jira story text, PRD context, target scope, and acceptance criteria into bounded coverage items. Playwright generator behavior maps to `qa-executor`, which inspects the target-local Playwright project, creates run-local seed proof, and promotes proven behavior into BDD or framework files. Playwright healer behavior is split across executor repair and verifier acceptance: `qa-executor` repairs selected test-code or evidence gaps, while `qa-verifier` accepts only after seed proof, full Playwright execution, and scaffold/dependency policy checks pass.
+
 ## Command Surface
 
 The final CLI exposes only these commands:
@@ -100,14 +104,14 @@ Generic non-Playwright framework support is outside this lean contract.
 
 ## Copilot Runtime Configuration
 
-`.qa-harness/config.json` stores product-level harness configuration. It includes the Copilot command and no Codex configuration.
+`.qa-harness/config.json` stores product-level harness configuration. It includes the Copilot command, optional Copilot CLI args, and no Codex configuration.
 
 Platform defaults:
 
 - Windows: `copilot.cmd`
 - Non-Windows: `copilot`
 
-`copilot.ps1` is not the Windows default. Operators may override the Copilot command in `.qa-harness/config.json` when their environment requires a different executable path.
+`copilot.ps1` is not the Windows default. Operators may override the Copilot command in `.qa-harness/config.json` when their environment requires a different executable path. Operators may also set `copilot.args` for local permission flags such as `--allow-tool=write` or `--no-ask-user`.
 
 ## Artifact Layout
 

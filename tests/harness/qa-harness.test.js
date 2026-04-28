@@ -1431,6 +1431,46 @@ test('runCli keeps prepare state paths under .qa-harness for traversal-like feat
   );
 });
 
+test('prepare preserves configured Copilot command args when refreshing artifacts', (t) => {
+  const repoRoot = createTempRepo(t);
+  const harnessPaths = resolveHarnessPaths(repoRoot);
+  writeFeature(repoRoot, 'Features/x.feature', [
+    'Feature: Checkout',
+    '',
+    '  Scenario: Complete purchase',
+    '    Given the browser session is open',
+  ].join('\n'));
+  fs.mkdirSync(path.join(repoRoot, '.git', 'info'), { recursive: true });
+  writeTextFile(
+    harnessPaths.configPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      loop: {
+        defaultMaxIterations: 7,
+      },
+      copilot: {
+        command: 'custom-copilot.cmd',
+        args: [
+          '--allow-all',
+          '--no-ask-user',
+        ],
+      },
+    }, null, 2)}\n`,
+  );
+
+  const exitCode = runCli(['prepare', '--from', 'Features/x.feature'], {
+    repoRoot,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  });
+
+  const config = JSON.parse(fs.readFileSync(harnessPaths.configPath, 'utf8'));
+  assert.equal(exitCode, 0);
+  assert.equal(config.loop.defaultMaxIterations, 7);
+  assert.equal(config.copilot.command, 'custom-copilot.cmd');
+  assert.deepEqual(config.copilot.args, ['--allow-all', '--no-ask-user']);
+});
+
 test('prepare --from creates lean harness artifacts for the selected feature', (t) => {
   const repoRoot = createTempRepo(t);
   const featureContent = [
@@ -2005,6 +2045,52 @@ test('run CLI executor prompts provide run-local seed workflow artifact paths', 
   assert.match(workerPrompt, /working navigation, interactions, waits, assertions, and locators/);
   assert.match(workerPrompt, /seed is evidence, not final BDD output/);
   assert.doesNotMatch(workerPrompt, /\.qa-harness\/runs\/<run-id>\/seed\.spec\.ts/);
+});
+
+test('run CLI executor prompts include target-local CLI and no-reinstall dependency policy', (t) => {
+  const { repoRoot, harnessPaths } = createPreparedLeanRun(t, {
+    prepareNow: new Date('2026-04-27T09:15:30.000Z'),
+    progressContent: buildLeanProgressDocument([
+      { id: 'P-CLI-POLICY', goal: 'inspect executor command policy in the worker prompt.' },
+    ]),
+  });
+  const { runner } = createLeanRunCommandRunner({
+    workerResult: {
+      status: 0,
+      stdout: [
+        'fake Copilot invocation',
+        'RALPH_STATUS: blocked',
+        'RALPH_SUMMARY: command policy prompt inspected',
+        'RALPH_VALIDATION: not run',
+        'RALPH_NEXT: none',
+        '',
+      ].join('\n'),
+      stderr: '',
+    },
+  });
+
+  const exitCode = runCli(['run', '--max-iterations', '1'], {
+    repoRoot,
+    now: new Date('2026-04-27T09:15:45.000Z'),
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    commandRunner: runner,
+  });
+  const state = JSON.parse(fs.readFileSync(harnessPaths.statePath, 'utf8'));
+  const runPaths = resolveHarnessPaths(repoRoot, { runId: state.latestRunId });
+  const workerPrompt = fs.readFileSync(path.join(runPaths.iterationsDir, '001', 'worker-prompt.md'), 'utf8');
+
+  assert.equal(exitCode, 1);
+  assert.match(workerPrompt, /target-local CLI/i);
+  assert.match(workerPrompt, /`npx --no-install playwright`/);
+  assert.match(workerPrompt, /`npx --no-install bddgen`/);
+  assert.match(workerPrompt, /normal coverage work[^.\n]*do not run `npm init playwright`/i);
+  assert.match(workerPrompt, /normal coverage work[^.\n]*ad hoc `npm install`/i);
+  assert.match(workerPrompt, /automatic `playwright-cli install --skills`/i);
+  assert.match(workerPrompt, /missing[^.\n]*(?:Playwright|playwright-bdd|browsers|fixtures)[^.\n]*blocked/i);
+  assert.match(workerPrompt, /`npm install --save-dev @playwright\/test playwright-bdd`/);
+  assert.match(workerPrompt, /`npx playwright install`/);
+  assert.match(workerPrompt, /do not run (?:those )?install commands automatically/i);
 });
 
 test('run CLI records Playwright CLI seed evidence before supervisor verification for coverage executor work', (t) => {
@@ -2672,6 +2758,85 @@ test('run CLI passes the worker prompt to fake Copilot on stdin', (t) => {
   assert.match(capturedStdin, /^RALPH_STATUS: pass\|blocked\|fail$/m);
   assert.equal(workerCalls[0].args.join(' ').includes('Unique stdin PRD objective'), false);
   assert.equal(workerCalls[0].args.join(' ').includes('prove stdin prompt delivery'), false);
+});
+
+test('run CLI passes configured Copilot args without putting the prompt in argv', (t) => {
+  const repoRoot = createTempRepo(t);
+  writeFeature(repoRoot, 'Features/x.feature', [
+    'Feature: Checkout',
+    '',
+    '  Scenario: Complete purchase',
+    '    Given the browser session is open',
+  ].join('\n'));
+  fs.mkdirSync(path.join(repoRoot, '.git', 'info'), { recursive: true });
+
+  prepare({
+    repoRoot,
+    from: 'Features/x.feature',
+    platform: 'linux',
+    now: new Date('2026-04-27T07:42:00.000Z'),
+  });
+
+  const harnessPaths = resolveHarnessPaths(repoRoot);
+  writeTextFile(
+    harnessPaths.configPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      copilot: {
+        command: 'fake-copilot',
+        args: [
+          '--allow-tool=write',
+          '--allow-tool=shell(npx:*)',
+          '--no-ask-user',
+        ],
+      },
+    }, null, 2)}\n`,
+  );
+  writeTextFile(
+    harnessPaths.progressPath,
+    buildLeanProgressDocument([
+      { id: 'P-ARGS', goal: 'prove configured Copilot args are used.' },
+    ]),
+  );
+
+  const workerCalls = [];
+  const runner = (command, args, cwd, commandOptions) => {
+    if (command === 'fake-copilot') {
+      workerCalls.push({ command, args, cwd, commandOptions });
+      return {
+        status: 0,
+        stdout: [
+          'fake Copilot received configured args',
+          'RALPH_STATUS: blocked',
+          'RALPH_SUMMARY: args inspected',
+          'RALPH_VALIDATION: not run',
+          'RALPH_NEXT: none',
+          '',
+        ].join('\n'),
+        stderr: '',
+      };
+    }
+
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+  };
+
+  const exitCode = runCli(['run', '--max-iterations', '1'], {
+    repoRoot,
+    now: new Date('2026-04-27T07:43:00.000Z'),
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    commandRunner: runner,
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(workerCalls.length, 1);
+  assert.deepEqual(workerCalls[0].args, [
+    '--allow-tool=write',
+    '--allow-tool=shell(npx:*)',
+    '--no-ask-user',
+  ]);
+  assert.match(workerCalls[0].commandOptions.input, /prove configured Copilot args are used/);
+  assert.equal(workerCalls[0].args.join(' ').includes('prove configured Copilot args are used'), false);
 });
 
 test('run CLI creates fresh prompts when the orchestrator routes executor work to verifier', (t) => {

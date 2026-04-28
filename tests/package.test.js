@@ -155,7 +155,14 @@ test('static four-agent role templates ship with role-scoped responsibilities', 
     {
       role: 'qa-planner',
       dir: 'planner',
-      required: [/RALPH_AGENT: qa-planner/, /creates and refines `.qa-harness\/PRD\.md`/i, /splits work into bounded progress items/i, /does not run browser discovery/i],
+      required: [
+        /RALPH_AGENT: qa-planner/,
+        /creates and refines `.qa-harness\/PRD\.md`/i,
+        /splits work into bounded progress items/i,
+        /one item per acceptance criterion/i,
+        /Do not leave a single omnibus implementation item/i,
+        /does not run browser discovery/i,
+      ],
       forbidden: [/seed\.spec\.ts/i, /final verification proof/i],
     },
     {
@@ -188,6 +195,124 @@ test('static four-agent role templates ship with role-scoped responsibilities', 
         assert.doesNotMatch(content, pattern, `${role} ${fileName} must avoid ${pattern}`);
       }
     }
+  }
+});
+
+test('executor templates forbid Playwright setup commands during normal coverage work', () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const templates = [
+    {
+      label: 'executor agent.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'executor', 'agent.md'), 'utf8'),
+    },
+    {
+      label: 'executor skills.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'executor', 'skills.md'), 'utf8'),
+    },
+  ];
+
+  for (const { label, content } of templates) {
+    assert.match(
+      content,
+      /normal coverage work[^.\n]*do not (?:run|use|execute)[^.\n]*`npm init playwright`/i,
+      `${label} must forbid npm init playwright during normal coverage work`,
+    );
+    assert.match(
+      content,
+      /normal coverage work[^.\n]*do not (?:run|use|execute)[^.\n]*(?:ad hoc|ad-hoc)[^.\n]*`npm install`/i,
+      `${label} must forbid ad hoc npm install during normal coverage work`,
+    );
+    assert.match(
+      content,
+      /normal coverage work[^.\n]*do not (?:run|use|execute)[^.\n]*automatic[^.\n]*`playwright-cli install --skills`/i,
+      `${label} must forbid automatic playwright-cli install --skills during normal coverage work`,
+    );
+  }
+});
+
+test('executor templates require target-local Playwright inspection before browser work', () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const templates = [
+    {
+      label: 'executor agent.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'executor', 'agent.md'), 'utf8'),
+    },
+    {
+      label: 'executor skills.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'executor', 'skills.md'), 'utf8'),
+    },
+  ];
+
+  for (const { label, content } of templates) {
+    assert.match(
+      content,
+      /before browser work[^.\n]*(?:inspect|read)[^.\n]*target-local Playwright[^.\n]*`package\.json`[^.\n]*`playwright\.config\.\*`[^.\n]*existing fixtures[^.\n]*`Features\/\*\*\/\*\.feature`[^.\n]*`Features\/steps\/\*\*\/\*\.ts`/i,
+      `${label} must require target-local Playwright inspection before browser work`,
+    );
+  }
+});
+
+test('planner templates map Jira story criteria into atomic progress items', () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const templates = [
+    {
+      label: 'planner agent.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'planner', 'agent.md'), 'utf8'),
+    },
+    {
+      label: 'planner skills.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'planner', 'skills.md'), 'utf8'),
+    },
+  ];
+
+  for (const { label, content } of templates) {
+    assert.match(
+      content,
+      /Jira story acceptance criteria[^.\n]*(?:split|map|turn)[^.\n]*separate atomic progress items[^.\n]*separate user-visible behaviors/i,
+      `${label} must map Jira story acceptance criteria into separate atomic progress items`,
+    );
+    assert.match(
+      content,
+      /one-item exception[^.\n]*truly atomic stories/i,
+      `${label} must keep the one-item exception only for truly atomic stories`,
+    );
+  }
+});
+
+test('verifier templates reject unrelated dependency and scaffold churn', () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const templates = [
+    {
+      label: 'verifier agent.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'verifier', 'agent.md'), 'utf8'),
+    },
+    {
+      label: 'verifier skills.md',
+      content: fs.readFileSync(path.join(packageRoot, 'templates', 'qa-agents', 'verifier', 'skills.md'), 'utf8'),
+    },
+  ];
+
+  for (const { label, content } of templates) {
+    assert.match(
+      content,
+      /reject dependency\/scaffold churn unrelated to the selected item/i,
+      `${label} must reject dependency/scaffold churn unrelated to the selected item`,
+    );
+    assert.match(
+      content,
+      /unexpected Playwright reinstallation/i,
+      `${label} must reject unexpected Playwright reinstallation`,
+    );
+    assert.match(
+      content,
+      /generated starter tests/i,
+      `${label} must reject generated starter tests`,
+    );
+    assert.match(
+      content,
+      /package metadata churn/i,
+      `${label} must reject package metadata churn`,
+    );
   }
 });
 

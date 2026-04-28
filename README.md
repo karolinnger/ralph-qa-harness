@@ -20,11 +20,14 @@ The product worker runtime is Copilot CLI. `ralph-codex` and Codex are only used
 - A target project with:
   - local `@playwright/test`
   - local `playwright-bdd`
+  - installed Playwright browser binaries
   - `playwright.config.*`
   - `Features/**/*.feature`
   - `Features/steps/**/*.ts`
 
 On Windows, the default product worker command is `copilot.cmd`. On non-Windows platforms, the default command is `copilot`. Operators may override the command in `.qa-harness/config.json` when their environment requires an explicit path or different executable name.
+
+Target projects own their Playwright setup before the harness runs. Operators should install and maintain the target-local packages and browser binaries, for example with `npm install --save-dev @playwright/test playwright-bdd` and `npx playwright install` in the target project when that project has not already documented equivalent setup commands. Harness workers may report missing dependencies, browser binaries, or fixtures as blocked operator setup with exact commands, but they do not run install or scaffold commands during coverage work.
 
 ## Install From Source
 
@@ -83,6 +86,8 @@ Features/
 ```
 
 Playwright is required for browser/test integration, and `playwright-bdd` is required for executable feature generation. The harness does not provide generic non-Playwright framework support.
+
+The harness uses the target project's existing Playwright and BDD installation. Coverage workers inspect `package.json`, `playwright.config.*`, existing fixtures, `Features/**/*.feature`, and `Features/steps/**/*.ts` before browser work; they must not bootstrap Playwright with `npm init playwright`, perform ad hoc `npm install`, run automatic browser installs, or invoke `playwright-cli install --skills` as part of normal coverage work.
 
 ## Quick Start
 
@@ -157,7 +162,7 @@ Runs the orchestrator-owned four-agent product loop. Without an explicit overrid
 - routes executor work to verifier review before final pass
 - marks the selected item complete only when `qa-verifier` reports `RALPH_STATUS: pass` and supervisor verification passes
 
-Coverage executor work must produce Playwright CLI seed evidence first. MCP fallback is allowed second only when Playwright CLI discovery cannot proceed and the worker records a fallback reason plus durable MCP evidence.
+Coverage executor work must produce Playwright CLI seed evidence first, using target-local commands such as `npx --no-install playwright`, `npx --no-install bddgen`, or harness-resolved local CLIs. MCP fallback is allowed second only when Playwright CLI discovery cannot proceed and the worker records a fallback reason plus durable MCP evidence. Missing Playwright packages, browser binaries, `playwright-bdd`, or required fixtures are blocked operator setup, not permission for workers to reinstall or scaffold Playwright inside the target project.
 
 Worker output must end with:
 
@@ -235,7 +240,7 @@ The harness must not add those entries to tracked `.gitignore`.
 ## Runtime Files
 
 - `.qa-harness/config.json`
-  Stores product-level configuration, including the Copilot command. It does not store Codex configuration.
+  Stores product-level configuration, including the Copilot command and optional Copilot CLI args. It does not store Codex configuration.
 - `.qa-harness/PRD.md`
   Stores the concise run objective generated from the selected feature path.
 - `.qa-harness/progress.md`

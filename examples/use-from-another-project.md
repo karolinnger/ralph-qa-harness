@@ -22,11 +22,16 @@ For local package development, install from the package checkout instead:
 npm install --save-dev ../ralph-qa-harness
 ```
 
-## 2. Install the required test layers
+## 2. Install the target Playwright dependencies and browsers
+
+Operators must prepare the target project's Playwright stack before running the harness:
 
 ```bash
 npm install --save-dev @playwright/test playwright-bdd
+npx playwright install
 ```
+
+If the target project needs fixture, account, tenant, feature-flag, or database setup, run that setup before starting coverage work. Harness workers must not install dependencies, install browser binaries, or scaffold Playwright during coverage work. When required packages, browsers, or fixtures are missing, workers should record blocked evidence with the exact operator setup command instead of running it themselves.
 
 ## 3. Check the target project
 
